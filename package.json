@@ -18,6 +18,8 @@
     "mobile:prepare": "node scripts/prepare-mobile.js",
     "cap:sync": "npm run mobile:prepare && npx cap sync android",
     "apk:debug": "npm run cap:sync && cd android && gradlew.bat assembleDebug",
+    "build:launcher": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-launcher.ps1",
+    "shortcut:update": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/create-shortcut.ps1",
     "e2e:mock": "node scripts/e2e-mock-server.js"
   },
   "dependencies": {

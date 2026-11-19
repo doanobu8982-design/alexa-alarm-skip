@@ -19,6 +19,8 @@ object AlarmRefreshScheduler {
     private const val PERIODIC_WORK_NAME = "alexa_alarm_periodic_refresh"
     private const val IMMEDIATE_WORK_NAME = "alexa_alarm_immediate_refresh"
     private const val PRE_TRIGGER_WORK_NAME = "alexa_alarm_pre_trigger"
+    internal const val UNIQUE_DEFERRED_FALLBACK_WORK_NAME = "alexa_alarm_deferred_fallback"
+    internal const val DEFERRED_FALLBACK_DELAY_SECONDS = 5L
 
     private fun networkConstraints(): Constraints {
         return Constraints.Builder()
@@ -73,5 +75,36 @@ object AlarmRefreshScheduler {
             ExistingWorkPolicy.REPLACE,
             request
         )
+    }
+
+    internal fun buildDeferredFallbackWorkRequest(
+        delaySeconds: Long = DEFERRED_FALLBACK_DELAY_SECONDS
+    ): OneTimeWorkRequest {
+        return OneTimeWorkRequestBuilder<AlarmRefreshWorker>()
+            .setInitialDelay(delaySeconds, TimeUnit.SECONDS)
+            .setConstraints(networkConstraints())
+            .setBackoffCriteria(
+                BackoffPolicy.LINEAR,
+                WorkRequest.MIN_BACKOFF_MILLIS,
+                TimeUnit.MILLISECONDS
+            )
+            .build()
+    }
+
+    fun enqueueDeferredFallbackRefresh(
+        context: Context,
+        delaySeconds: Long = DEFERRED_FALLBACK_DELAY_SECONDS
+    ) {
+        val request = buildDeferredFallbackWorkRequest(delaySeconds)
+        WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
+            UNIQUE_DEFERRED_FALLBACK_WORK_NAME,
+            ExistingWorkPolicy.REPLACE,
+            request
+        )
+    }
+
+    fun cancelDeferredFallbackRefresh(context: Context) {
+        WorkManager.getInstance(context.applicationContext)
+            .cancelUniqueWork(UNIQUE_DEFERRED_FALLBACK_WORK_NAME)
     }
 }

@@ -18,6 +18,8 @@ BACKUP_SOURCE_PATH = ICON_DIR / "source_icon.jfif"
 ANDROID_DIR = ICON_DIR / "android"
 MASTER_ICON_PATH = ICON_DIR / "icon-master-1024.png"
 APP_ICO_PATH = ICON_DIR / "app.ico"
+APP_32_PNG_PATH = ICON_DIR / "app-32.png"
+APP_48_PNG_PATH = ICON_DIR / "app-48.png"
 
 MASTER_SIZE = 1024
 DEFAULT_COLOR_TOLERANCE = 36
@@ -25,10 +27,13 @@ DEFAULT_EDGE_FEATHER = 28
 ALPHA_CROP_THRESHOLD = 16
 BOUNDARY_FILTER_SIZE = 5  # 5x5 MaxFilter covers 8-neighborhood distance 1..2 px
 MIN_UNPREMULTIPLY_RATIO = 0.25
+SMALL_ICON_SHARPEN_MAX_PX = 48
 
-ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+ICO_SIZES = [(16, 16), (24, 24), (32, 32), (40, 40), (48, 48), (64, 64), (128, 128), (256, 256)]
 
 DESKTOP_PNG_TARGETS = [
+    (APP_32_PNG_PATH.name, 32),
+    (APP_48_PNG_PATH.name, 48),
     ("app-192.png", 192),
     ("app-256.png", 256),
 ]
@@ -286,10 +291,24 @@ def collect_output_paths() -> list[Path]:
     return paths
 
 
+def resize_icon_frame(master: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Resize master RGBA icon with LANCZOS and apply RGB-only unsharp mask for small sizes."""
+    resized = master.resize(size, Image.Resampling.LANCZOS)
+    if size[0] > SMALL_ICON_SHARPEN_MAX_PX:
+        return resized
+
+    r, g, b, a = resized.split()
+    rgb = Image.merge("RGB", (r, g, b)).filter(
+        ImageFilter.UnsharpMask(radius=0.6, percent=90, threshold=2)
+    )
+    sr, sg, sb = rgb.split()
+    return Image.merge("RGBA", (sr, sg, sb, a))
+
+
 def save_resized_png(master: Image.Image, target_path: Path, size: int) -> None:
     """Resize master 1024x1024 image to square PNG and save."""
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    resized = master.resize((size, size), Image.Resampling.LANCZOS)
+    resized = resize_icon_frame(master, (size, size))
     resized.save(target_path, format="PNG")
 
 
@@ -331,7 +350,8 @@ def generate_icons(source_path: Path, tolerance: int, feather: int, dry_run: boo
     for rel, size in ANDROID_FLAT_TARGETS + ANDROID_MIPMAP_TARGETS:
         save_resized_png(master, ANDROID_DIR / rel, size)
 
-    master.save(APP_ICO_PATH, format="ICO", sizes=ICO_SIZES)
+    frames = [resize_icon_frame(master, s) for s in ICO_SIZES]
+    frames[-1].save(APP_ICO_PATH, format="ICO", sizes=ICO_SIZES, append_images=frames[:-1])
     print(f"Generated {len(outputs)} transparent icon files under {ICON_DIR}")
 
 

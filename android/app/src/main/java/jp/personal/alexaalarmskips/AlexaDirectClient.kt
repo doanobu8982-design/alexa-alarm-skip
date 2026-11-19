@@ -17,6 +17,16 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.TimeUnit
 
+internal fun JSONObject.optCleanString(key: String, fallback: String = ""): String {
+    if (isNull(key)) return fallback
+    val raw = optString(key, fallback)
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty() || trimmed.equals("null", ignoreCase = true)) {
+        return fallback
+    }
+    return raw
+}
+
 data class FetchResult(
     val ok: Boolean,
     val refreshedCookie: Boolean,
@@ -71,9 +81,9 @@ class AlexaDirectClient(
         if (!cookieFile.exists() || !cookieFile.isFile) return false
         return try {
             val json = JSONObject(cookieFile.readText(Charsets.UTF_8))
-            val hasLocal = json.optString("localCookie", "").isNotBlank() ||
-                json.optString("cookie", "").isNotBlank()
-            val hasRefresh = json.optString("refreshToken", "").isNotBlank()
+            val hasLocal = json.optCleanString("localCookie", "").isNotBlank() ||
+                json.optCleanString("cookie", "").isNotBlank()
+            val hasRefresh = json.optCleanString("refreshToken", "").isNotBlank()
             hasLocal || hasRefresh
         } catch (_: Exception) {
             false
@@ -81,8 +91,8 @@ class AlexaDirectClient(
     }
 
     fun needsTokenRefresh(cookieJson: JSONObject, nowMs: Long = nowProvider()): Boolean {
-        val localCookie = cookieJson.optString("localCookie", "")
-        val csrf = cookieJson.optString("csrf", "")
+        val localCookie = cookieJson.optCleanString("localCookie", "")
+        val csrf = cookieJson.optCleanString("csrf", "")
         if (localCookie.isBlank() || csrf.isBlank()) {
             return true
         }
@@ -94,15 +104,15 @@ class AlexaDirectClient(
     }
 
     fun fetchAccessToken(cookieJson: JSONObject): String {
-        val loginCookieInitial = cookieJson.optString("loginCookie", "")
-        val refreshToken = cookieJson.optString("refreshToken", "")
+        val loginCookieInitial = cookieJson.optCleanString("loginCookie", "")
+        val refreshToken = cookieJson.optCleanString("refreshToken", "")
         if (loginCookieInitial.isBlank() || refreshToken.isBlank()) {
             throw AlexaAuthException("No former registration data provided for Cookie Refresh", 401)
         }
 
         val baseAmazonPage = DEFAULT_BASE_AMAZON_PAGE
         val acceptLanguage = DEFAULT_ACCEPT_LANGUAGE
-        val deviceAppName = cookieJson.optString("deviceAppName", "").ifBlank { DEFAULT_APP_NAME }
+        val deviceAppName = cookieJson.optCleanString("deviceAppName", "").ifBlank { DEFAULT_APP_NAME }
 
         // Step 1: POST https://api.${baseAmazonPage}/auth/token
         val step1Body = FormBody.Builder(Charsets.UTF_8)
@@ -143,7 +153,7 @@ class AlexaDirectClient(
         } catch (e: Exception) {
             throw AlexaAuthException("Failed to parse token refresh response: ${e.message}", step1Res.statusCode)
         }
-        val accessToken = step1Json.optString("access_token", "")
+        val accessToken = step1Json.optCleanString("access_token", "")
         if (accessToken.isBlank()) {
             throw AlexaAuthException("No new access token in Refresh Token response", step1Res.statusCode)
         }
@@ -151,17 +161,17 @@ class AlexaDirectClient(
     }
 
     fun refreshCookieData(cookieJson: JSONObject): JSONObject {
-        val loginCookieInitial = cookieJson.optString("loginCookie", "")
-        val refreshToken = cookieJson.optString("refreshToken", "")
+        val loginCookieInitial = cookieJson.optCleanString("loginCookie", "")
+        val refreshToken = cookieJson.optCleanString("refreshToken", "")
         if (loginCookieInitial.isBlank() || refreshToken.isBlank()) {
             throw AlexaAuthException("No former registration data provided for Cookie Refresh", 401)
         }
 
-        val amazonPage = cookieJson.optString("amazonPage", "").ifBlank { DEFAULT_AMAZON_PAGE }
+        val amazonPage = cookieJson.optCleanString("amazonPage", "").ifBlank { DEFAULT_AMAZON_PAGE }
         val baseAmazonPage = DEFAULT_BASE_AMAZON_PAGE
         val acceptLanguage = DEFAULT_ACCEPT_LANGUAGE
-        val deviceAppName = cookieJson.optString("deviceAppName", "").ifBlank { DEFAULT_APP_NAME }
-        val browserUserAgent = cookieJson.optString("userAgent", "").ifBlank { BROWSER_USER_AGENT }
+        val deviceAppName = cookieJson.optCleanString("deviceAppName", "").ifBlank { DEFAULT_APP_NAME }
+        val browserUserAgent = cookieJson.optCleanString("userAgent", "").ifBlank { BROWSER_USER_AGENT }
 
         val accessToken = fetchAccessToken(cookieJson)
         val loginCookieMap = parseCookieMap(loginCookieInitial)
@@ -289,7 +299,7 @@ class AlexaDirectClient(
         mockUrl: String? = null,
         persistCookie: Boolean = true
     ): Boolean {
-        val alarmId = job.optString("alarmId", "").ifBlank { job.optString("id", "") }
+        val alarmId = job.optCleanString("alarmId", "").ifBlank { job.optCleanString("id", "") }
         if (alarmId.isBlank()) {
             throw IllegalArgumentException("alarmId is required for skipAlarm")
         }
@@ -302,7 +312,7 @@ class AlexaDirectClient(
             return true
         }
 
-        val type = job.optString("type", "Alarm")
+        val type = job.optCleanString("type", "Alarm")
         return executeWithAuthApi(persistCookie) { amazonPage, localCookie, csrf, userAgent, alexaApiUrl, accessToken ->
             if (isAlarmType(type)) {
                 executeAuthApiPut(
@@ -334,7 +344,7 @@ class AlexaDirectClient(
         persistCookie: Boolean = true,
         restoreWaitMs: Long = 500L
     ): Boolean {
-        val alarmId = job.optString("alarmId", "").ifBlank { job.optString("id", "") }
+        val alarmId = job.optCleanString("alarmId", "").ifBlank { job.optCleanString("id", "") }
         if (alarmId.isBlank()) {
             throw IllegalArgumentException("alarmId is required for restoreAlarm")
         }
@@ -342,17 +352,17 @@ class AlexaDirectClient(
             val body = JSONObject().apply {
                 put("id", alarmId)
                 put("notificationIndex", alarmId)
-                put("originalDate", job.optString("originalDate", ""))
-                put("originalTime", job.optString("originalTime", ""))
+                put("originalDate", job.optCleanString("originalDate", ""))
+                put("originalTime", job.optCleanString("originalTime", ""))
             }
             executeMockPost("${mockUrl.trimEnd('/')}/api/alarms/restore", body)
             return true
         }
 
-        val type = job.optString("type", "Alarm")
+        val type = job.optCleanString("type", "Alarm")
         val (targetDate, targetTime) = resolveRestoreDateTime(job, nowProvider())
-        val musicAlarmId = job.optString("musicAlarmId", "")
-        val soundId = job.optString("soundId", "")
+        val musicAlarmId = job.optCleanString("musicAlarmId", "")
+        val soundId = job.optCleanString("soundId", "")
         val assetId = if (musicAlarmId.isNotBlank()) "MUSIC-$musicAlarmId" else soundId
 
         return executeWithAuthApi(persistCookie) { _, _, _, _, alexaApiUrl, accessToken ->
@@ -370,7 +380,7 @@ class AlexaDirectClient(
                 val trigger = JSONObject().apply {
                     put("scheduledTime", "${targetDate}T${timePart}")
                 }
-                val recurrence = buildV2Recurrence(job.optString("recurringPattern", ""))
+                val recurrence = buildV2Recurrence(job.optCleanString("recurringPattern", ""))
                 if (recurrence != null) {
                     trigger.put("recurrence", recurrence)
                 }
@@ -428,7 +438,7 @@ class AlexaDirectClient(
             if (persistCookie) {
                 atomicWriteJson(cookieFile, cookieJson)
             }
-        } else if (cookieJson.optString("accessToken", "").isBlank()) {
+        } else if (cookieJson.optCleanString("accessToken", "").isBlank()) {
             val fetchedToken = fetchAccessToken(cookieJson)
             cookieJson = JSONObject(cookieJson.toString()).apply {
                 put("accessToken", fetchedToken)
@@ -439,11 +449,11 @@ class AlexaDirectClient(
         }
 
         fun runOnce(cj: JSONObject) {
-            val amazonPage = cj.optString("amazonPage", "").ifBlank { DEFAULT_AMAZON_PAGE }
-            val localCookie = cj.optString("localCookie", "").ifBlank { cj.optString("cookie", "") }
-            val csrf = cj.optString("csrf", "")
-            val userAgent = cj.optString("userAgent", "").ifBlank { BROWSER_USER_AGENT }
-            val accessToken = cj.optString("accessToken", "")
+            val amazonPage = cj.optCleanString("amazonPage", "").ifBlank { DEFAULT_AMAZON_PAGE }
+            val localCookie = cj.optCleanString("localCookie", "").ifBlank { cj.optCleanString("cookie", "") }
+            val csrf = cj.optCleanString("csrf", "")
+            val userAgent = cj.optCleanString("userAgent", "").ifBlank { BROWSER_USER_AGENT }
+            val accessToken = cj.optCleanString("accessToken", "")
             if (localCookie.isBlank() || csrf.isBlank() || accessToken.isBlank()) {
                 throw AlexaAuthException("Missing localCookie, csrf, or accessToken", 401)
             }
@@ -483,7 +493,7 @@ class AlexaDirectClient(
         } catch (e: Exception) {
             throw AlexaAuthException("Invalid endpoints response", 401)
         }
-        val apiUrl = json.optString("alexaApiUrl", "")
+        val apiUrl = json.optCleanString("alexaApiUrl", "")
         if (apiUrl.isBlank()) {
             throw IllegalStateException("alexaApiUrl missing in /api/endpoints response")
         }
@@ -601,8 +611,8 @@ class AlexaDirectClient(
     }
 
     private fun resolveRestoreDateTime(job: JSONObject, nowMs: Long): Pair<String, String> {
-        val desiredDate = job.optString("originalDate", "")
-        val desiredTime = job.optString("originalTime", "")
+        val desiredDate = job.optCleanString("originalDate", "")
+        val desiredTime = job.optCleanString("originalTime", "")
         if (desiredDate.isNotBlank() && desiredTime.isNotBlank()) {
             val desiredMs = parseTimestampMs("${desiredDate}T${desiredTime}")
             if (desiredMs != null && desiredMs > nowMs - PAST_GRACE_MS) {
@@ -639,9 +649,9 @@ class AlexaDirectClient(
 
         for (i in 0 until notifications.length()) {
             val n = notifications.optJSONObject(i) ?: continue
-            val type = n.optString("type", "")
+            val type = n.optCleanString("type", "")
             if (!isAlarmType(type)) continue
-            if (n.optString("status", "") != "ON") continue
+            if (n.optCleanString("status", "") != "ON") continue
             val scheduledMs = nextTriggerMs(n) ?: continue
 
             val expectedNextMs = computeExpectedNextMs(n, nowMs)
@@ -684,14 +694,14 @@ class AlexaDirectClient(
     }
 
     private fun fetchNotificationsAndDevices(cookieJson: JSONObject): Pair<JSONArray, JSONArray> {
-        val amazonPage = cookieJson.optString("amazonPage", "").ifBlank { DEFAULT_AMAZON_PAGE }
-        val localCookie = cookieJson.optString("localCookie", "")
-            .ifBlank { cookieJson.optString("cookie", "") }
-        val csrf = cookieJson.optString("csrf", "")
+        val amazonPage = cookieJson.optCleanString("amazonPage", "").ifBlank { DEFAULT_AMAZON_PAGE }
+        val localCookie = cookieJson.optCleanString("localCookie", "")
+            .ifBlank { cookieJson.optCleanString("cookie", "") }
+        val csrf = cookieJson.optCleanString("csrf", "")
         if (localCookie.isBlank() || csrf.isBlank()) {
             throw AlexaAuthException("Missing localCookie or csrf", 401)
         }
-        val browserUserAgent = cookieJson.optString("userAgent", "").ifBlank { BROWSER_USER_AGENT }
+        val browserUserAgent = cookieJson.optCleanString("userAgent", "").ifBlank { BROWSER_USER_AGENT }
 
         val notifBody = executeAlexaApiGet(
             url = "https://alexa.$amazonPage/api/notifications",
@@ -810,8 +820,8 @@ class AlexaDirectClient(
 
         for (i in 0 until domainCookies.length()) {
             val c = domainCookies.optJSONObject(i) ?: continue
-            val name = c.optString("Name", "")
-            val value = c.optString("Value", "")
+            val name = c.optCleanString("Name", "")
+            val value = c.optCleanString("Value", "")
             if (name.isNotBlank()) {
                 cookieMap[name] = value
             }
@@ -907,10 +917,10 @@ class AlexaDirectClient(
         val map = LinkedHashMap<String, String>()
         for (i in 0 until devices.length()) {
             val d = devices.optJSONObject(i) ?: continue
-            val serial = d.optString("serialNumber", "")
+            val serial = d.optCleanString("serialNumber", "")
             if (serial.isBlank()) continue
-            val name = d.optString("accountName", "")
-                .ifBlank { d.optString("deviceName", "") }
+            val name = d.optCleanString("accountName", "")
+                .ifBlank { d.optCleanString("deviceName", "") }
                 .ifBlank { serial }
             map[serial] = name
         }
@@ -926,16 +936,16 @@ class AlexaDirectClient(
         scheduledMs: Long?
     ): JSONObject {
         val parts = formatTimeParts(whenMs, nowMs)
-        val serial = n.optString("deviceSerialNumber", "")
-        val rawOriginalDate = n.optString("originalDate", "")
-        val rawOriginalTime = n.optString("originalTime", "")
+        val serial = n.optCleanString("deviceSerialNumber", "")
+        val rawOriginalDate = n.optCleanString("originalDate", "")
+        val rawOriginalTime = n.optCleanString("originalTime", "")
         val effectiveDate = if (isSkipped) parts.dateKey else rawOriginalDate.ifBlank { parts.dateKey }
         val effectiveTime = rawOriginalTime.ifBlank { formatJstTimeWithMs(whenMs) }
-        val recurringPattern = if (n.isNull("recurringPattern")) null else n.optString("recurringPattern", "").ifBlank { null }
-        val notifIndex = n.optString("notificationIndex", "").ifBlank { n.optString("id", "") }
-        val label = n.optString("alarmLabel", "")
-            .ifBlank { n.optString("reminderLabel", "") }
-            .ifBlank { n.optString("label", "") }
+        val recurringPattern = if (n.isNull("recurringPattern")) null else n.optCleanString("recurringPattern", "").ifBlank { null }
+        val notifIndex = n.optCleanString("notificationIndex", "").ifBlank { n.optCleanString("id", "") }
+        val label = n.optCleanString("alarmLabel", "")
+            .ifBlank { n.optCleanString("reminderLabel", "") }
+            .ifBlank { n.optCleanString("label", "") }
         val scheduledDate = rawOriginalDate.ifBlank {
             if (scheduledMs != null) jstDateKey(scheduledMs) else ""
         }
@@ -945,8 +955,8 @@ class AlexaDirectClient(
             put("notificationIndex", notifIndex)
             put("deviceSerialNumber", serial)
             put("deviceName", deviceMap[serial] ?: serial.ifBlank { "不明な端末" })
-            put("type", n.optString("type", "Alarm").ifBlank { "Alarm" })
-            put("status", n.optString("status", "ON").ifBlank { "ON" })
+            put("type", n.optCleanString("type", "Alarm").ifBlank { "Alarm" })
+            put("status", n.optCleanString("status", "ON").ifBlank { "ON" })
             put("label", label)
             put("recurringPattern", recurringPattern ?: JSONObject.NULL)
             put("recurringText", formatRecurring(recurringPattern))
@@ -968,12 +978,12 @@ class AlexaDirectClient(
         val next = if (hasAlarm) active.optJSONObject(0) else null
         val nextAlarmObj = if (next != null) {
             JSONObject().apply {
-                put("id", next.optString("id", ""))
-                put("timeText", next.optString("timeText", ""))
-                put("dayBadge", next.optString("dayBadge", ""))
-                put("dateLabel", next.optString("dateLabel", ""))
-                put("deviceName", next.optString("deviceName", ""))
-                put("label", next.optString("label", ""))
+                put("id", next.optCleanString("id", ""))
+                put("timeText", next.optCleanString("timeText", ""))
+                put("dayBadge", next.optCleanString("dayBadge", ""))
+                put("dateLabel", next.optCleanString("dateLabel", ""))
+                put("deviceName", next.optCleanString("deviceName", ""))
+                put("label", next.optCleanString("label", ""))
                 put("whenMs", next.optLong("whenMs", 0L))
             }
         } else {
@@ -1009,7 +1019,7 @@ class AlexaDirectClient(
     }
 
     private fun nextTriggerMs(n: JSONObject): Long? {
-        val triggerScheduled = n.optJSONObject("trigger")?.optString("scheduledTime", "")
+        val triggerScheduled = n.optJSONObject("trigger")?.optCleanString("scheduledTime", "")
         if (!triggerScheduled.isNullOrBlank()) {
             parseTimestampMs(triggerScheduled)?.let { return it }
         }
@@ -1019,8 +1029,8 @@ class AlexaDirectClient(
         } else if (alarmTimeVal is Number && alarmTimeVal.toLong() > 0L) {
             return alarmTimeVal.toLong()
         }
-        val origDate = n.optString("originalDate", "")
-        val origTime = n.optString("originalTime", "")
+        val origDate = n.optCleanString("originalDate", "")
+        val origTime = n.optCleanString("originalTime", "")
         if (origDate.isNotBlank() && origTime.isNotBlank()) {
             parseTimestampMs("${origDate}T${origTime}")?.let { return it }
         }
@@ -1033,7 +1043,7 @@ class AlexaDirectClient(
     }
 
     private fun getRecurrenceRule(n: JSONObject): RecurrenceRule? {
-        val pattern = if (n.isNull("recurringPattern")) "" else n.optString("recurringPattern", "")
+        val pattern = if (n.isNull("recurringPattern")) "" else n.optCleanString("recurringPattern", "")
         when (pattern) {
             "P1D" -> return RecurrenceRule("DAILY", setOf(0, 1, 2, 3, 4, 5, 6))
             "XXXX-WD" -> return RecurrenceRule("WEEKLY", setOf(1, 2, 3, 4, 5))
@@ -1047,7 +1057,7 @@ class AlexaDirectClient(
 
         val trigRec = n.optJSONObject("trigger")?.optJSONObject("recurrence")
         if (trigRec != null) {
-            val freq = trigRec.optString("freq", "")
+            val freq = trigRec.optCleanString("freq", "")
             val interval = trigRec.optInt("interval", 1)
             if (freq.isNotBlank() && interval <= 1) {
                 if (freq == "DAILY") {
@@ -1065,7 +1075,7 @@ class AlexaDirectClient(
 
         val rRule = n.optJSONObject("rRuleData")
         if (rRule != null) {
-            val freq = rRule.optString("frequency", "")
+            val freq = rRule.optCleanString("frequency", "")
             val intervals = rRule.optJSONArray("intervals")
             val interval = if (intervals != null && intervals.length() > 0) intervals.optInt(0, 1) else 1
             if (freq.isNotBlank() && interval <= 1) {
@@ -1096,7 +1106,7 @@ class AlexaDirectClient(
     }
 
     private fun extractAlarmTimeOfDay(n: JSONObject, fallbackMs: Long?): TimeOfDay? {
-        val origTime = n.optString("originalTime", "")
+        val origTime = n.optCleanString("originalTime", "")
         if (origTime.isNotBlank()) {
             val m = TIME_OF_DAY_REGEX.find(origTime)
             if (m != null) {

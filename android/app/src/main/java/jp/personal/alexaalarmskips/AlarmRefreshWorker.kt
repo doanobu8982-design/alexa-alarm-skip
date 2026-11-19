@@ -57,7 +57,14 @@ class AlarmRefreshWorker(
         val mockUrl = inputData.getString(KEY_MOCK_URL)
         return try {
             val client = AlexaDirectClient(cookieFile)
-            drainPendingMutations(prefs, client, mockUrl)
+            drainPendingMutations(
+                prefs = prefs,
+                client = client,
+                mockUrl = mockUrl,
+                onDeferredInFlight = {
+                    AlarmRefreshScheduler.enqueueDeferredFallbackRefresh(applicationContext)
+                }
+            )
 
             val result = client.fetchAndBuildSummary(
                 forceRefresh = forceRefresh,
@@ -152,20 +159,36 @@ class AlarmRefreshWorker(
         fun drainPendingMutations(
             prefs: android.content.SharedPreferences,
             client: AlexaDirectClient,
-            mockUrl: String? = null
+            mockUrl: String? = null,
+            nowProvider: () -> Long = { System.currentTimeMillis() },
+            onDeferredInFlight: (() -> Unit)? = null
         ): Int {
             var processed = 0
+            var hasDeferredInFlight = false
             while (true) {
-                val head = synchronized(AlarmWidgetPlugin.MUTATION_LOCK) {
+                var targetIndex = -1
+                val targetJob = synchronized(AlarmWidgetPlugin.MUTATION_LOCK) {
                     val queue = AlarmWidgetPlugin.readPendingMutationsArray(prefs)
-                    if (queue.length() == 0) null else queue.optJSONObject(0)
+                    var found: org.json.JSONObject? = null
+                    for (i in 0 until queue.length()) {
+                        val candidate = queue.optJSONObject(i) ?: continue
+                        val candidateOpId = candidate.optString("opId", "")
+                        if (AlarmWidgetPlugin.isWebMutationInFlight(candidateOpId, nowProvider())) {
+                            hasDeferredInFlight = true
+                            continue
+                        }
+                        targetIndex = i
+                        found = candidate
+                        break
+                    }
+                    found
                 } ?: break
 
-                val opId = head.optString("opId", "")
-                val action = head.optString("action", "")
+                val opId = targetJob.optString("opId", "")
+                val action = targetJob.optString("action", "")
                 when (action) {
-                    "skip" -> client.skipAlarm(head, mockUrl = mockUrl, persistCookie = true)
-                    "restore" -> client.restoreAlarm(head, mockUrl = mockUrl, persistCookie = true)
+                    "skip" -> client.skipAlarm(targetJob, mockUrl = mockUrl, persistCookie = true)
+                    "restore" -> client.restoreAlarm(targetJob, mockUrl = mockUrl, persistCookie = true)
                     else -> Log.w(TAG, "Unknown pending mutation action: $action (opId=$opId)")
                 }
 
@@ -177,7 +200,7 @@ class AlarmRefreshWorker(
                         if (opId.isNotBlank() && item.optString("opId", "") == opId) {
                             continue
                         }
-                        if (opId.isBlank() && i == 0) {
+                        if (opId.isBlank() && i == targetIndex) {
                             continue
                         }
                         next.put(item)
@@ -187,6 +210,14 @@ class AlarmRefreshWorker(
                         .commit()
                 }
                 processed += 1
+            }
+            if (hasDeferredInFlight) {
+                val remaining = synchronized(AlarmWidgetPlugin.MUTATION_LOCK) {
+                    AlarmWidgetPlugin.readPendingMutationsArray(prefs).length()
+                }
+                if (remaining > 0) {
+                    onDeferredInFlight?.invoke()
+                }
             }
             return processed
         }

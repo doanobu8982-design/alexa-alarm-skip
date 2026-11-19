@@ -12,6 +12,183 @@ const HEARTBEAT_STALE_TIMEOUT_MS = 60000;
 const MAX_SHUTDOWN_DRAIN_MS = 30000;
 const DRAIN_POLL_INTERVAL_MS = 100;
 const DEFAULT_LOCK_FILE = path.join(os.tmpdir(), 'alexa-alarm-app.lock.json');
+const DEFAULT_APP_WINDOW_WIDTH = 420;
+const DEFAULT_APP_WINDOW_HEIGHT = 720;
+const DEFAULT_WINDOW_LEFT = 80;
+const DEFAULT_WINDOW_TOP = 80;
+const MIN_VALID_COORDINATE = -10000;
+const SESSION_FILE_PATTERN = /^(Apps|Tabs|Session)_/i;
+
+function parsePositiveInt(raw, fallback) {
+  const num = Number(raw);
+  return Number.isInteger(num) && num > 0 ? num : fallback;
+}
+
+function resolveAppWindowSize() {
+  return {
+    width: parsePositiveInt(process.env.ALEXA_WINDOW_WIDTH, DEFAULT_APP_WINDOW_WIDTH),
+    height: parsePositiveInt(process.env.ALEXA_WINDOW_HEIGHT, DEFAULT_APP_WINDOW_HEIGHT),
+  };
+}
+
+function isPlacementLeaf(obj) {
+  return obj !== null
+    && typeof obj === 'object'
+    && !Array.isArray(obj)
+    && Number.isFinite(obj.left)
+    && Number.isFinite(obj.top);
+}
+
+function collectPlacementLeaves(node, pathKeys, results) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return;
+  for (const [key, val] of Object.entries(node)) {
+    const nextPath = pathKeys.concat(key);
+    if (isPlacementLeaf(val)) {
+      results.push({ path: nextPath.join('.'), value: val });
+    } else if (val && typeof val === 'object' && !Array.isArray(val)) {
+      collectPlacementLeaves(val, nextPath, results);
+    }
+  }
+}
+
+function extractAppPlacementLeaf(node, pathKeys = []) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
+  if (isPlacementLeaf(node)) return node;
+  const leaves = [];
+  collectPlacementLeaves(node, pathKeys, leaves);
+  if (leaves.length === 0) return null;
+  const localHit = leaves.find((entry) => entry.path.includes('127'));
+  return (localHit || leaves[0]).value;
+}
+
+function extractWorkArea(placement) {
+  if (!placement || typeof placement !== 'object') return null;
+  const { work_area_left, work_area_top, work_area_right, work_area_bottom } = placement;
+  if (
+    !Number.isFinite(work_area_left)
+    || !Number.isFinite(work_area_top)
+    || !Number.isFinite(work_area_right)
+    || !Number.isFinite(work_area_bottom)
+  ) {
+    return null;
+  }
+  if (work_area_right <= work_area_left || work_area_bottom <= work_area_top) {
+    return null;
+  }
+  return { work_area_left, work_area_top, work_area_right, work_area_bottom };
+}
+
+function clampWindowPosition(rawLeft, rawTop, width, height, workArea) {
+  let left = Number.isFinite(rawLeft) && rawLeft >= MIN_VALID_COORDINATE ? rawLeft : DEFAULT_WINDOW_LEFT;
+  let top = Number.isFinite(rawTop) && rawTop >= MIN_VALID_COORDINATE ? rawTop : DEFAULT_WINDOW_TOP;
+
+  if (workArea) {
+    const maxLeft = Math.max(workArea.work_area_left, workArea.work_area_right - width);
+    const maxTop = Math.max(workArea.work_area_top, workArea.work_area_bottom - height);
+    left = Math.round(Math.min(Math.max(left, workArea.work_area_left), maxLeft));
+    top = Math.round(Math.min(Math.max(top, workArea.work_area_top), maxTop));
+    return { left, top };
+  }
+
+  return { left: Math.round(left), top: Math.round(top) };
+}
+
+function clearChromeSessionFiles(userDataDir) {
+  if (!userDataDir) return;
+  const sessionsDir = path.join(userDataDir, 'Default', 'Sessions');
+  if (!fs.existsSync(sessionsDir)) return;
+  let entries;
+  try {
+    entries = fs.readdirSync(sessionsDir);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (!SESSION_FILE_PATTERN.test(name)) continue;
+    try {
+      fs.rmSync(path.join(sessionsDir, name), { force: true });
+    } catch {
+      // ロック中のファイルがあっても他のセッション掃除を続行
+    }
+  }
+}
+
+function updateAllPlacementLeaves(node, normalizedPlacement) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return 0;
+  let count = 0;
+  for (const [key, val] of Object.entries(node)) {
+    if (isPlacementLeaf(val)) {
+      node[key] = { ...val, ...normalizedPlacement };
+      count += 1;
+    } else if (val && typeof val === 'object' && !Array.isArray(val)) {
+      count += updateAllPlacementLeaves(val, normalizedPlacement);
+    }
+  }
+  return count;
+}
+
+function resetChromeWindowPlacement(profileDir, width = DEFAULT_APP_WINDOW_WIDTH, height = DEFAULT_APP_WINDOW_HEIGHT) {
+  const fallbackPos = { left: DEFAULT_WINDOW_LEFT, top: DEFAULT_WINDOW_TOP };
+  if (!profileDir) return fallbackPos;
+  clearChromeSessionFiles(profileDir);
+
+  const prefsPath = path.join(profileDir, 'Default', 'Preferences');
+  if (!fs.existsSync(prefsPath)) return fallbackPos;
+
+  let prefs;
+  try {
+    const raw = fs.readFileSync(prefsPath, 'utf8');
+    prefs = JSON.parse(raw);
+  } catch (err) {
+    console.warn('[Window] Failed to reset Chrome window_placement:', err.message);
+    return fallbackPos;
+  }
+  if (!prefs || typeof prefs !== 'object') return fallbackPos;
+
+  if (!prefs.browser || typeof prefs.browser !== 'object') {
+    prefs.browser = {};
+  }
+
+  const appLeaf = extractAppPlacementLeaf(prefs.browser.app_window_placement);
+  const winLeaf = isPlacementLeaf(prefs.browser.window_placement) ? prefs.browser.window_placement : null;
+  const sourcePlacement = appLeaf || winLeaf;
+  const workArea = extractWorkArea(sourcePlacement);
+  const { left, top } = clampWindowPosition(
+    sourcePlacement ? sourcePlacement.left : undefined,
+    sourcePlacement ? sourcePlacement.top : undefined,
+    width,
+    height,
+    workArea
+  );
+
+  const normalizedPlacement = {
+    ...(workArea || {}),
+    left,
+    top,
+    right: left + width,
+    bottom: top + height,
+    maximized: false,
+  };
+
+  prefs.browser.window_placement = {
+    ...(winLeaf || {}),
+    ...normalizedPlacement,
+  };
+
+  const updatedLeaves = updateAllPlacementLeaves(prefs.browser.app_window_placement, normalizedPlacement);
+  if (updatedLeaves === 0) {
+    prefs.browser.app_window_placement = {
+      127: { 0: { 0: { '1_/': { ...normalizedPlacement } } } },
+    };
+  }
+
+  try {
+    fs.writeFileSync(prefsPath, JSON.stringify(prefs), 'utf8');
+  } catch (err) {
+    console.warn('[Window] Failed to write Chrome window_placement:', err.message);
+  }
+  return { left, top };
+}
 
 function openExternalBrowser(url) {
   if (!url) return;
@@ -114,6 +291,8 @@ function closeHttpServer(srv) {
 
 function createWindowManager(options = {}) {
   const lockFile = options.lockFile || DEFAULT_LOCK_FILE;
+  const userDataDirOption = options.userDataDir || null;
+  const execFn = typeof options.exec === 'function' ? options.exec : childProcess.exec;
   const getServers = typeof options.getServers === 'function' ? options.getServers : () => [];
   const isBusy = typeof options.isBusy === 'function' ? options.isBusy : () => false;
   const hasPendingWork = typeof options.hasPendingWork === 'function' ? options.hasPendingWork : isBusy;
@@ -261,10 +440,15 @@ function createWindowManager(options = {}) {
   }
 
   function launchAppBrowser(port) {
-    const userDataDir = path.join(os.homedir(), '.alexa-alarm-app-chrome');
+    const userDataDir = userDataDirOption || path.join(os.homedir(), '.alexa-alarm-app-chrome');
+    const { width, height } = resolveAppWindowSize();
+    const { left, top } = resetChromeWindowPlacement(userDataDir, width, height);
     const appUrl = `http://127.0.0.1:${port}/`;
-    const cmd = `start "" chrome --app=${appUrl} --user-data-dir="${userDataDir}" --new-window --window-size=440,660 --no-first-run --no-default-browser-check`;
-    childProcess.exec(cmd, (err) => {
+    const commonFlags = `--app=${appUrl} --user-data-dir="${userDataDir}" --new-window --window-position=${left},${top} --window-size=${width},${height} --no-first-run --no-default-browser-check --disable-session-crashed-bubble`;
+    const cmd = process.platform === 'win32'
+      ? `start "" chrome ${commonFlags}`
+      : `google-chrome ${commonFlags}`;
+    execFn(cmd, (err) => {
       if (err) {
         console.error('[Launch] Failed to start Chrome:', err.message);
       }
@@ -285,15 +469,22 @@ function createWindowManager(options = {}) {
 }
 
 module.exports = {
+  DEFAULT_APP_WINDOW_HEIGHT,
+  DEFAULT_APP_WINDOW_WIDTH,
   DEFAULT_LOCK_FILE,
   HEARTBEAT_CHECK_INTERVAL_MS,
   HEARTBEAT_INITIAL_TIMEOUT_MS,
   HEARTBEAT_STALE_TIMEOUT_MS,
   MAX_SHUTDOWN_DRAIN_MS,
+  clampWindowPosition,
+  clearChromeSessionFiles,
   createWindowManager,
+  extractAppPlacementLeaf,
   focusAppWindow,
   isPidAlive,
   openExternalBrowser,
   probeExistingInstance,
   requestFocusExistingInstance,
+  resetChromeWindowPlacement,
+  resolveAppWindowSize,
 };

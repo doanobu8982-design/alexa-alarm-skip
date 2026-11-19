@@ -268,6 +268,69 @@ describe('nodejs/server.js HTTP API & 24h widget summary', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('POST /api/alarms/skip succeeds without needsLogin when cookie and refreshToken coexist in alexa-cookie.json', async () => {
+    const tmpDir = createTempDir();
+    const cookieFile = path.join(tmpDir, 'alexa-cookie.json');
+    fs.writeFileSync(cookieFile, JSON.stringify({
+      cookie: 'session-id=123; csrf=abc',
+      localCookie: 'session-id=123; csrf=abc',
+      refreshToken: 'Atnr|valid-refresh-token',
+      macDms: { device_private_key: 'k', adp_token: 't' },
+    }), 'utf8');
+
+    const AlexaRemote = require('alexa-remote2');
+    const fixedNow = Date.parse('2026-11-15T10:00:00+09:00');
+    class CoexistingCookieAlexa extends AlexaRemote {
+      init(opts, cb) {
+        this._options = opts;
+        this.setCookie(opts.cookie);
+        this.endpoints = { alexaApiUrl: 'https://alexa.amazon.co.jp' };
+        process.nextTick(() => cb(null));
+      }
+      getDevices(cb) {
+        process.nextTick(() => cb(null, { devices: [{ serialNumber: 'DEV1', accountName: 'Echo' }] }));
+      }
+      getNotifications(cached, cb) {
+        process.nextTick(() => cb(null, {
+          notifications: [{
+            notificationIndex: 'n-coexist',
+            type: 'Alarm',
+            status: 'ON',
+            deviceSerialNumber: 'DEV1',
+            trigger: { scheduledTime: '2026-11-15T12:00:00+09:00' },
+          }],
+        }));
+      }
+      cancelNotification(notification, cb) {
+        if (!this.cookieData || !this.cookieData.refreshToken) {
+          process.nextTick(() => cb(new TypeError("Cannot read properties of null (reading 'refreshToken')")));
+          return;
+        }
+        process.nextTick(() => cb(null));
+      }
+    }
+
+    const authManager = createAlexaAuthManager({ cookieFile, AlexaRemoteClass: CoexistingCookieAlexa });
+    const alarmService = createAlarmService(authManager, { restoreWaitMs: 1, nowFn: () => fixedNow });
+    const srv = createMobileServer({ authManager, alarmService });
+
+    try {
+      const { port } = await srv.start();
+      const baseUrl = `http://127.0.0.1:${port}`;
+      const skip = await httpRequest(baseUrl, '/api/alarms/skip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'n-coexist' }),
+      });
+      assert.equal(skip.status, 200);
+      assert.equal(skip.body.ok, true);
+      assert.equal(skip.body.needsLogin, undefined);
+    } finally {
+      await srv.stop();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('scripts/mobile-preview-server.js (--mock)', () => {
@@ -627,7 +690,7 @@ describe('www/app.js CapgoInAppBrowser integration', () => {
     // Skip remaining tomorrow alarm -> overall .empty only
     elements.timelineList._listeners.click(makeSkipClick(0));
     const afterAllSkipped = elements.timelineList.innerHTML;
-    assert.ok(afterAllSkipped.includes('<div class="empty">直近24時間以内の ON アラームはありません</div>'));
+    assert.ok(afterAllSkipped.includes('<div class="empty">直近のアラームはありません</div>'));
     assert.equal(afterAllSkipped.includes('empty-group'), false);
     assert.equal(afterAllSkipped.includes('date-divider'), false);
 
@@ -744,5 +807,270 @@ describe('www/app.js CapgoInAppBrowser integration', () => {
     assert.equal(enqueued[0].alarmId, 'n-1');
     assert.equal(completed.length, 1);
     assert.equal(completed[0], enqueued[0].opId);
+  });
+
+  it('www/app.js sanitizes "null" labels from cached state and calls releaseInFlightMutation on skip failure', async () => {
+    const rootDir = path.resolve(__dirname, '..');
+    const appCode = fs.readFileSync(path.join(rootDir, 'www', 'app.js'), 'utf8');
+    const released = [];
+
+    const makeEl = () => ({
+      textContent: '',
+      title: '',
+      className: '',
+      hidden: false,
+      disabled: false,
+      innerHTML: '',
+      _listeners: {},
+      classList: { add() {}, remove() {} },
+      setAttribute() {},
+      addEventListener(type, fn) { this._listeners[type] = fn; },
+    });
+    const elements = {
+      statusBar: makeEl(),
+      loadingOverlay: makeEl(),
+      metaText: makeEl(),
+      loginCard: makeEl(),
+      timelineList: makeEl(),
+      skippedList: makeEl(),
+      tabActiveBtn: makeEl(),
+      tabSkippedBtn: makeEl(),
+      activeCountText: makeEl(),
+      skippedCountText: makeEl(),
+      panelActive: makeEl(),
+      panelSkipped: makeEl(),
+      restoreAllBtn: makeEl(),
+      refreshBtn: makeEl(),
+      openLoginBtn: makeEl(),
+    };
+    const getEl = (id) => elements[id] || makeEl();
+
+    const cachedPayload = {
+      active: [{
+        id: 'n-null',
+        notificationIndex: 'n-null',
+        deviceSerialNumber: 'DEV1',
+        deviceName: 'Echo',
+        type: 'Alarm',
+        label: 'null',
+        recurringText: '毎日',
+        originalDate: '2026-11-19',
+        originalTime: '06:30:00.000',
+        timeText: '06:30',
+        dayBadge: '今日',
+        dateLabel: '今日 11/19 (木)',
+        dateKey: '2026-11-19',
+        whenMs: 1000,
+      }],
+      skipped: [],
+      deviceCount: 1,
+      checkedAt: '05:00:00',
+    };
+
+    vm.runInNewContext(appCode, {
+      window: {
+        location: { search: '?mockUrl=http://127.0.0.1:9999', origin: 'http://localhost' },
+        open() {},
+        Capacitor: {
+          isNativePlatform: () => true,
+          Plugins: {
+            AlarmWidget: {
+              async getCachedState() {
+                return { hasCache: true, alarmsPayloadJson: JSON.stringify(cachedPayload) };
+              },
+              async enqueueMutation() { return { queued: true, count: 1 }; },
+              async releaseInFlightMutation(opts) { released.push(opts.opId); return { ok: true }; },
+            },
+          },
+        },
+      },
+      document: { visibilityState: 'visible', getElementById: getEl, addEventListener() {} },
+      URLSearchParams,
+      console,
+      setInterval: () => 1,
+      clearInterval: () => {},
+      fetch: async (url) => {
+        if (url.endsWith('/api/alarms')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => cachedPayload,
+          };
+        }
+        return {
+          ok: false,
+          status: 500,
+          json: async () => ({ error: 'network failure', needsLogin: false }),
+        };
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(elements.timelineList.innerHTML.includes('alarm-label'), false);
+    assert.equal(elements.timelineList.innerHTML.includes('>null<'), false);
+
+    elements.timelineList._listeners.click({
+      target: {
+        closest(sel) {
+          return sel === 'button[data-action="skip"]' ? { getAttribute: () => '0' } : null;
+        },
+      },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.equal(released.length, 1);
+  });
+
+  it('www/app.js calls AlarmWidget.updateWidgetSummary optimistically before API resolves on skip, restore, and restoreAll', async () => {
+    const rootDir = path.resolve(__dirname, '..');
+    const appCode = fs.readFileSync(path.join(rootDir, 'www', 'app.js'), 'utf8');
+    const summaryUpdates = [];
+    const deferredResponses = [];
+
+    const makeEl = () => ({
+      textContent: '',
+      title: '',
+      className: '',
+      hidden: false,
+      disabled: false,
+      innerHTML: '',
+      _listeners: {},
+      classList: { add() {}, remove() {} },
+      setAttribute() {},
+      addEventListener(type, fn) { this._listeners[type] = fn; },
+    });
+    const elements = {
+      statusBar: makeEl(),
+      loadingOverlay: makeEl(),
+      metaText: makeEl(),
+      loginCard: makeEl(),
+      timelineList: makeEl(),
+      skippedList: makeEl(),
+      tabActiveBtn: makeEl(),
+      tabSkippedBtn: makeEl(),
+      activeCountText: makeEl(),
+      skippedCountText: makeEl(),
+      panelActive: makeEl(),
+      panelSkipped: makeEl(),
+      restoreAllBtn: makeEl(),
+      refreshBtn: makeEl(),
+      openLoginBtn: makeEl(),
+    };
+    const getEl = (id) => elements[id] || makeEl();
+
+    const alarm1 = {
+      id: 'a-1',
+      notificationIndex: 'a-1',
+      deviceSerialNumber: 'DEV1',
+      deviceName: 'Echo',
+      type: 'Alarm',
+      label: '',
+      recurringText: '毎日',
+      originalDate: '2026-11-20',
+      originalTime: '08:00:00.000',
+      timeText: '08:00',
+      dayBadge: '明日 (金)',
+      dateLabel: '明日 11/20 (金)',
+      dateKey: '2026-11-20',
+      whenMs: 1000,
+    };
+    const alarm2 = {
+      id: 'a-2',
+      notificationIndex: 'a-2',
+      deviceSerialNumber: 'DEV1',
+      deviceName: 'Echo',
+      type: 'Alarm',
+      label: '仕事',
+      recurringText: '毎日',
+      originalDate: '2026-11-20',
+      originalTime: '08:30:00.000',
+      timeText: '08:30',
+      dayBadge: '明日 (金)',
+      dateLabel: '明日 11/20 (金)',
+      dateKey: '2026-11-20',
+      whenMs: 2000,
+    };
+
+    vm.runInNewContext(appCode, {
+      window: {
+        location: { search: '?mockUrl=http://127.0.0.1:9999', origin: 'http://localhost' },
+        open() {},
+        Capacitor: {
+          isNativePlatform: () => true,
+          Plugins: {
+            AlarmWidget: {
+              async updateWidgetSummary(opts) {
+                summaryUpdates.push(JSON.parse(opts.summaryJson));
+                return { ok: true };
+              },
+              async enqueueMutation() { return { queued: true, count: 1 }; },
+              async completeMutation() { return { removed: true, count: 0 }; },
+            },
+          },
+        },
+      },
+      document: { visibilityState: 'visible', getElementById: getEl, addEventListener() {} },
+      URLSearchParams,
+      console,
+      setInterval: () => 1,
+      clearInterval: () => {},
+      fetch: (url) => {
+        if (url.endsWith('/api/alarms')) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({
+              active: [alarm1, alarm2],
+              skipped: [],
+              deviceCount: 1,
+              checkedAt: '05:00:00',
+            }),
+          });
+        }
+        return new Promise((resolve) => {
+          deferredResponses.push({ url, resolve });
+        });
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(summaryUpdates.length, 0);
+
+    // 1. Skip alarm1 -> immediate optimistic updateWidgetSummary before API resolves
+    elements.timelineList._listeners.click({
+      target: { closest: (sel) => (sel === 'button[data-action="skip"]' ? { getAttribute: () => '0' } : null) },
+    });
+    assert.equal(summaryUpdates.length, 1);
+    assert.equal(summaryUpdates[0].hasAlarm, true);
+    assert.equal(summaryUpdates[0].nextAlarm.id, 'a-2');
+    assert.equal(summaryUpdates[0].remainingCount, 0);
+
+    // 2. Skip alarm2 -> immediate optimistic empty summary
+    elements.timelineList._listeners.click({
+      target: { closest: (sel) => (sel === 'button[data-action="skip"]' ? { getAttribute: () => '0' } : null) },
+    });
+    assert.equal(summaryUpdates.length, 2);
+    assert.equal(summaryUpdates[1].hasAlarm, false);
+    assert.equal(summaryUpdates[1].nextAlarm, null);
+
+    // 3. Restore single (alarm1) -> immediate optimistic updateWidgetSummary
+    elements.skippedList._listeners.click({
+      target: { closest: (sel) => (sel === 'button[data-action="restore"]' ? { getAttribute: () => '0' } : null) },
+    });
+    assert.equal(summaryUpdates.length, 3);
+    assert.equal(summaryUpdates[2].hasAlarm, true);
+    assert.equal(summaryUpdates[2].nextAlarm.id, 'a-1');
+
+    // 4. Skip alarm1 again, then RestoreAll -> single immediate optimistic summary with both alarms
+    elements.timelineList._listeners.click({
+      target: { closest: (sel) => (sel === 'button[data-action="skip"]' ? { getAttribute: () => '0' } : null) },
+    });
+    assert.equal(summaryUpdates.length, 4);
+    elements.restoreAllBtn._listeners.click();
+    assert.equal(summaryUpdates.length, 5);
+    assert.equal(summaryUpdates[4].hasAlarm, true);
+    assert.equal(summaryUpdates[4].nextAlarm.id, 'a-1');
+    assert.equal(summaryUpdates[4].remainingCount, 1);
+    assert.equal(summaryUpdates[4].totalCount, 2);
   });
 });

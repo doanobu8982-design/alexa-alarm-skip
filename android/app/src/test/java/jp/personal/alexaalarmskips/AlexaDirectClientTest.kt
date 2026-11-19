@@ -400,4 +400,135 @@ class AlexaDirectClientTest {
         assertEquals("/api/alarms/restore", recorded[1].second)
         assertEquals("[]", prefs.getString(AlarmWidgetProvider.KEY_PENDING_MUTATIONS_JSON, ""))
     }
+
+    @Test
+    fun classifyAndBuildPayload_treatsJsonNullLabelsAsEmptyString() {
+        val nowMs = jstEpochMs("2026-11-16T06:00:00+09:00")
+        val client = AlexaDirectClient(cookieFile = File("nonexistent-cookie.json"), nowProvider = { nowMs })
+
+        val devices = JSONArray().apply {
+            put(JSONObject().apply {
+                put("serialNumber", "DEV_001")
+                put("accountName", "寝室 Echo")
+            })
+        }
+
+        val notifications = JSONArray().apply {
+            put(JSONObject().apply {
+                put("notificationIndex", "alarm-null-label")
+                put("deviceSerialNumber", "DEV_001")
+                put("type", "Alarm")
+                put("status", "ON")
+                put("alarmLabel", JSONObject.NULL)
+                put("reminderLabel", JSONObject.NULL)
+                put("label", JSONObject.NULL)
+                put("recurringPattern", JSONObject.NULL)
+                put("originalDate", "2026-11-16")
+                put("originalTime", "07:30:00.000")
+                put("trigger", JSONObject().apply {
+                    put("scheduledTime", "2026-11-16T07:30:00.000+09:00")
+                })
+            })
+            put(JSONObject().apply {
+                put("notificationIndex", "alarm-null-string-label")
+                put("deviceSerialNumber", "DEV_001")
+                put("type", "Alarm")
+                put("status", "ON")
+                put("alarmLabel", "null")
+                put("reminderLabel", " NULL ")
+                put("label", "null")
+                put("originalDate", "2026-11-16")
+                put("originalTime", "08:00:00.000")
+                put("trigger", JSONObject().apply {
+                    put("scheduledTime", "2026-11-16T08:00:00.000+09:00")
+                })
+            })
+        }
+
+        val (payload, summary) = client.classifyAndBuildPayload(notifications, devices, nowMs)
+        val active = payload.getJSONArray("active")
+        assertEquals("", active.getJSONObject(0).getString("label"))
+        assertEquals("", active.getJSONObject(1).getString("label"))
+        assertEquals("", summary.getJSONObject("nextAlarm").getString("label"))
+    }
+
+    @Test
+    fun drainPendingMutations_skipsInFlightOpIdAndTriggersDeferredCallback() {
+        val recorded = CopyOnWriteArrayList<Triple<String, String, String>>()
+        val mockHttp = createRecordingClient(recorded)
+
+        val store = LinkedHashMap<String, Any?>()
+        val prefs = object : android.content.SharedPreferences {
+            override fun getAll(): MutableMap<String, *> = store
+            override fun getString(key: String?, defValue: String?): String? = (store[key] as? String) ?: defValue
+            override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? = defValues
+            override fun getInt(key: String?, defValue: Int): Int = defValue
+            override fun getLong(key: String?, defValue: Long): Long = defValue
+            override fun getFloat(key: String?, defValue: Float): Float = defValue
+            override fun getBoolean(key: String?, defValue: Boolean): Boolean = defValue
+            override fun contains(key: String?): Boolean = store.containsKey(key)
+            override fun registerOnSharedPreferenceChangeListener(listener: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+            override fun unregisterOnSharedPreferenceChangeListener(listener: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+            override fun edit(): android.content.SharedPreferences.Editor {
+                val pending = LinkedHashMap<String, Any?>()
+                return object : android.content.SharedPreferences.Editor {
+                    override fun putString(key: String?, value: String?): android.content.SharedPreferences.Editor {
+                        if (key != null) pending[key] = value
+                        return this
+                    }
+                    override fun putStringSet(key: String?, values: MutableSet<String>?) = this
+                    override fun putInt(key: String?, value: Int) = this
+                    override fun putLong(key: String?, value: Long) = this
+                    override fun putFloat(key: String?, value: Float) = this
+                    override fun putBoolean(key: String?, value: Boolean) = this
+                    override fun remove(key: String?) = this
+                    override fun clear() = this
+                    override fun commit(): Boolean {
+                        store.putAll(pending)
+                        return true
+                    }
+                    override fun apply() {
+                        store.putAll(pending)
+                    }
+                }
+            }
+        }
+
+        val initialQueue = JSONArray().apply {
+            put(JSONObject().apply {
+                put("opId", "op-inflight")
+                put("action", "skip")
+                put("alarmId", "a-1")
+            })
+            put(JSONObject().apply {
+                put("opId", "op-ready")
+                put("action", "skip")
+                put("alarmId", "a-2")
+            })
+        }
+        prefs.edit().putString(AlarmWidgetProvider.KEY_PENDING_MUTATIONS_JSON, initialQueue.toString()).commit()
+
+        AlarmWidgetPlugin.resetInFlightForTest()
+        try {
+            AlarmWidgetPlugin.markWebMutationInFlight("op-inflight", nowMs = 10_000L)
+            var deferredCalled = false
+            val client = AlexaDirectClient(cookieFile = File("unused.json"), client = mockHttp)
+            val processed = AlarmRefreshWorker.drainPendingMutations(
+                prefs = prefs,
+                client = client,
+                mockUrl = "http://127.0.0.1:9999",
+                nowProvider = { 12_000L },
+                onDeferredInFlight = { deferredCalled = true }
+            )
+            assertEquals(1, processed)
+            assertTrue(deferredCalled)
+            assertEquals(1, recorded.size)
+            assertTrue(recorded[0].third.contains("a-2"))
+            val remaining = JSONArray(prefs.getString(AlarmWidgetProvider.KEY_PENDING_MUTATIONS_JSON, "[]"))
+            assertEquals(1, remaining.length())
+            assertEquals("op-inflight", remaining.getJSONObject(0).getString("opId"))
+        } finally {
+            AlarmWidgetPlugin.resetInFlightForTest()
+        }
+    }
 }

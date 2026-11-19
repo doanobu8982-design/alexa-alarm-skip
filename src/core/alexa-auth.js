@@ -100,6 +100,23 @@ function resolveAlexaRemoteClass(customClass) {
   return require('alexa-remote2');
 }
 
+function prepareCookieForAlexaRemote(cookieData) {
+  if (!cookieData || typeof cookieData !== 'object') {
+    return cookieData;
+  }
+  if (cookieData.refreshToken || cookieData.localCookie) {
+    const copy = { ...cookieData };
+    if (!copy.localCookie && typeof copy.cookie === 'string') {
+      copy.localCookie = copy.cookie;
+    }
+    if (typeof copy.cookie === 'string') {
+      delete copy.cookie;
+    }
+    return copy;
+  }
+  return cookieData;
+}
+
 /**
  * Creates an OS-independent Alexa authentication and connection manager.
  * @param {object} [options]
@@ -116,6 +133,7 @@ function createAlexaAuthManager(options = {}) {
 
   let alexa = null;
   let alexaReady = null;
+  let loadedCookieSignature = null;
   let activeLoginClient = null;
   let authState = {
     status: 'ready',
@@ -168,6 +186,7 @@ function createAlexaAuthManager(options = {}) {
         } catch {}
       }
       fs.writeFileSync(cookieFile, JSON.stringify(data, null, 2));
+      loadedCookieSignature = getCookieFileSignature();
     } catch (e) {
       console.error(`Cookie の保存に失敗しました: ${e.message}`);
     }
@@ -183,7 +202,18 @@ function createAlexaAuthManager(options = {}) {
     const old = alexa;
     alexa = null;
     alexaReady = null;
+    loadedCookieSignature = null;
     cleanupClient(old);
+  }
+
+  function getCookieFileSignature() {
+    try {
+      if (!fs.existsSync(cookieFile)) return null;
+      const stat = fs.statSync(cookieFile);
+      return `${stat.mtimeMs}:${stat.size}`;
+    } catch {
+      return null;
+    }
   }
 
   function normalizeAlexaError(err) {
@@ -344,7 +374,14 @@ function createAlexaAuthManager(options = {}) {
     if (authState.status === 'logging_in') {
       return Promise.reject(new AuthRequiredError('Amazon へのログイン完了を待機しています。'));
     }
-    if (alexaReady) return alexaReady;
+    if (alexaReady) {
+      const currentSig = getCookieFileSignature();
+      if (currentSig && loadedCookieSignature && currentSig !== loadedCookieSignature) {
+        resetConnection();
+      } else {
+        return alexaReady;
+      }
+    }
     alexaReady = new Promise((resolve, reject) => {
       let settled = false;
       const failOnce = (err) => {
@@ -373,6 +410,7 @@ function createAlexaAuthManager(options = {}) {
         failOnce(new AuthRequiredError('ログイン情報がありません。Amazon アカウントへのログインが必要です。'));
         return;
       }
+      loadedCookieSignature = getCookieFileSignature();
 
       const client = new AlexaRemote();
       alexa = client;
@@ -390,7 +428,7 @@ function createAlexaAuthManager(options = {}) {
         amazonPageProxyLanguage: 'ja_JP',
         proxyLanguage: 'ja_JP',
         bluetooth: false,
-        cookie: savedCookie,
+        cookie: prepareCookieForAlexaRemote(savedCookie),
         macDms: (savedCookie && savedCookie.macDms) || {},
         formerRegistrationData: (savedCookie && savedCookie.refreshToken) ? savedCookie : undefined,
         cookieRefreshInterval: COOKIE_REFRESH_INTERVAL_MS,
@@ -408,6 +446,10 @@ function createAlexaAuthManager(options = {}) {
           failOnce(normalizeAlexaError(err));
           return;
         }
+        if (savedCookie && typeof savedCookie === 'object' && savedCookie.refreshToken && !client.cookieData) {
+          client.cookieData = { ...savedCookie };
+        }
+        loadedCookieSignature = getCookieFileSignature();
         settled = true;
         authState = {
           status: 'ready',
@@ -420,6 +462,27 @@ function createAlexaAuthManager(options = {}) {
     return alexaReady;
   }
 
+  async function runWithAuthRetry(operation) {
+    try {
+      return await operation();
+    } catch (err) {
+      if (!isAuthError(err) || authState.status === 'logging_in') {
+        throw err;
+      }
+      let diskCookie = null;
+      try {
+        diskCookie = loadSavedCookie();
+      } catch {
+        diskCookie = null;
+      }
+      if (!diskCookie) {
+        throw err;
+      }
+      resetConnection();
+      return operation();
+    }
+  }
+
   return {
     getCookieFile,
     loadSavedCookie,
@@ -430,6 +493,7 @@ function createAlexaAuthManager(options = {}) {
     startProxyLogin,
     connectAlexa,
     resetConnection,
+    runWithAuthRetry,
   };
 }
 
@@ -440,4 +504,5 @@ module.exports = {
   createAlexaAuthManager,
   getFreePort,
   isAuthError,
+  prepareCookieForAlexaRemote,
 };

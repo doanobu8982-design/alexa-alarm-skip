@@ -8,6 +8,7 @@ import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 
 @CapacitorPlugin(name = "AlarmWidget")
 class AlarmWidgetPlugin : Plugin() {
@@ -147,6 +148,7 @@ class AlarmWidgetPlugin : Plugin() {
             next.length()
         }
 
+        markWebMutationInFlight(opId)
         AlarmRefreshScheduler.enqueueImmediateRefresh(context)
 
         val result = JSObject()
@@ -187,9 +189,40 @@ class AlarmWidgetPlugin : Plugin() {
             Pair(didRemove, next.length())
         }
 
+        clearWebMutationInFlight(opId)
+        if (count == 0) {
+            AlarmRefreshScheduler.cancelDeferredFallbackRefresh(context)
+        }
+
         val result = JSObject()
         result.put("removed", removed)
         result.put("count", count)
+        call.resolve(result)
+    }
+
+    @PluginMethod
+    fun releaseInFlightMutation(call: PluginCall) {
+        val opId = call.getString("opId")
+        if (opId.isNullOrBlank()) {
+            call.reject("opId is required")
+            return
+        }
+
+        clearWebMutationInFlight(opId)
+        val hasPending = synchronized(MUTATION_LOCK) {
+            val prefs = context.getSharedPreferences(
+                AlarmWidgetProvider.PREFS_NAME,
+                Context.MODE_PRIVATE
+            )
+            readPendingMutationsArray(prefs).length() > 0
+        }
+        if (hasPending) {
+            AlarmRefreshScheduler.enqueueImmediateRefresh(context)
+        }
+
+        val result = JSObject()
+        result.put("ok", true)
+        result.put("hasPending", hasPending)
         call.resolve(result)
     }
 
@@ -210,6 +243,32 @@ class AlarmWidgetPlugin : Plugin() {
 
     companion object {
         val MUTATION_LOCK = Any()
+        internal const val IN_FLIGHT_TTL_MS = 10_000L
+        private val inFlightWebMutations = ConcurrentHashMap<String, Long>()
+
+        internal fun markWebMutationInFlight(opId: String, nowMs: Long = System.currentTimeMillis()) {
+            if (opId.isBlank()) return
+            inFlightWebMutations[opId] = nowMs
+        }
+
+        internal fun clearWebMutationInFlight(opId: String) {
+            if (opId.isBlank()) return
+            inFlightWebMutations.remove(opId)
+        }
+
+        internal fun isWebMutationInFlight(opId: String, nowMs: Long = System.currentTimeMillis()): Boolean {
+            if (opId.isBlank()) return false
+            val startedAt = inFlightWebMutations[opId] ?: return false
+            if (nowMs - startedAt < IN_FLIGHT_TTL_MS) {
+                return true
+            }
+            inFlightWebMutations.remove(opId, startedAt)
+            return false
+        }
+
+        internal fun resetInFlightForTest() {
+            inFlightWebMutations.clear()
+        }
 
         fun readPendingMutationsArray(prefs: android.content.SharedPreferences): JSONArray {
             val raw = prefs.getString(AlarmWidgetProvider.KEY_PENDING_MUTATIONS_JSON, null)

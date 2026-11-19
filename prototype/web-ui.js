@@ -47,6 +47,8 @@ const {
 } = require('../src/desktop/window-manager');
 
 const APP_MODE = process.argv.includes('--app');
+const DESKTOP_HOST_MODE = process.argv.includes('--desktop-host');
+const DESKTOP_HOST_READY_PREFIX = '__ALEXA_HOST_READY__ ';
 const ENV_WEB_PORT = Number(process.env.ALEXA_WEB_PORT);
 const DEFAULT_PORT = process.env.ALEXA_WEB_PORT && Number.isInteger(ENV_WEB_PORT) && ENV_WEB_PORT >= 0
   ? ENV_WEB_PORT
@@ -55,12 +57,16 @@ const HOST = '127.0.0.1';
 const MAX_BODY_BYTES = 1024 * 1024;
 const ICON_DIR = path.join(__dirname, '..', 'assets', 'icons');
 const FAVICON_ICO_PATH = path.join(ICON_DIR, 'app.ico');
+const ICON_32_PATH = path.join(ICON_DIR, 'app-32.png');
+const ICON_48_PATH = path.join(ICON_DIR, 'app-48.png');
 const ICON_192_PATH = path.join(ICON_DIR, 'app-192.png');
 const ICON_256_PATH = path.join(ICON_DIR, 'app-256.png');
 const SPINNER_SVG_PATH = path.join(__dirname, '..', 'www', 'assets', 'spinner-90-ring.svg');
 const SPINNER_90_RING_SVG = fs.readFileSync(SPINNER_SVG_PATH, 'utf8').trim();
 const STATIC_ICON_ROUTES = {
   '/favicon.ico': { filePath: FAVICON_ICO_PATH, contentType: 'image/x-icon' },
+  '/icon-32.png': { filePath: ICON_32_PATH, contentType: 'image/png' },
+  '/icon-48.png': { filePath: ICON_48_PATH, contentType: 'image/png' },
   '/icon-192.png': { filePath: ICON_192_PATH, contentType: 'image/png' },
   '/icon-256.png': { filePath: ICON_256_PATH, contentType: 'image/png' },
 };
@@ -72,8 +78,9 @@ const WEB_MANIFEST = JSON.stringify({
   background_color: '#ffffff',
   theme_color: '#ffffff',
   icons: [
-    { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
-    { src: '/icon-256.png', sizes: '256x256', type: 'image/png' },
+    { src: '/icon-48.png', sizes: '48x48', type: 'image/png', purpose: 'any' },
+    { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+    { src: '/icon-256.png', sizes: '256x256', type: 'image/png', purpose: 'any' },
   ],
 });
 
@@ -130,13 +137,15 @@ function sendStaticFile(res, filePath, contentType) {
 }
 
 const PAGE = `<!DOCTYPE html>
-<html lang="ja">
+<html lang="ja" data-desktop-host="${DESKTOP_HOST_MODE ? '1' : '0'}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Alexa アラーム管理</title>
-<link rel="icon" type="image/x-icon" href="/favicon.ico">
 <link rel="icon" type="image/png" sizes="256x256" href="/icon-256.png">
+<link rel="icon" type="image/png" sizes="48x48" href="/icon-48.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
 <link rel="manifest" href="/manifest.webmanifest">
 <style>
   :root {
@@ -153,6 +162,15 @@ const PAGE = `<!DOCTYPE html>
     --restore-hover: #059669;
   }
   * { box-sizing: border-box; }
+  button:focus,
+  [tabindex]:focus {
+    outline: none;
+  }
+  button:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid rgba(56, 189, 248, 0.55);
+    outline-offset: 2px;
+  }
   html, body {
     margin: 0;
     padding: 0;
@@ -634,6 +652,12 @@ const PAGE = `<!DOCTYPE html>
 
 <script>
 (function () {
+  const DESKTOP_HOST_MODE = Boolean(
+    typeof document !== 'undefined' &&
+    document.documentElement &&
+    document.documentElement.getAttribute &&
+    document.documentElement.getAttribute('data-desktop-host') === '1'
+  );
   var AUTO_REFRESH_INTERVAL_MS = 60000;
   var state = {
     activeTab: 'active',
@@ -648,9 +672,29 @@ const PAGE = `<!DOCTYPE html>
     needsLogin: false,
     loginUrl: null,
     authPollTimer: null,
-    autoRefreshTimer: null
+    autoRefreshTimer: null,
+    mutationQueue: Promise.resolve()
   };
-  var mutationQueue = Promise.resolve();
+
+  function enqueueMutation(taskFn) {
+    state.pendingCount += 1;
+    var released = false;
+    function releasePending() {
+      if (released) return;
+      released = true;
+      state.pendingCount = Math.max(0, state.pendingCount - 1);
+    }
+    state.mutationQueue = state.mutationQueue
+      .catch(function () {})
+      .then(async function () {
+        try {
+          await taskFn(releasePending);
+        } finally {
+          releasePending();
+        }
+      });
+    return state.mutationQueue;
+  }
 
   function escapeHtml(str) {
     return String(str || '')
@@ -720,7 +764,7 @@ const PAGE = `<!DOCTYPE html>
 
   function renderActiveTimeline(items) {
     if (!Array.isArray(items) || items.length === 0) {
-      return '<div class="empty">直近24時間以内の ON アラームはありません</div>';
+      return '<div class="empty">直近のアラームはありません</div>';
     }
     var parts = [];
     var currentDateKey = null;
@@ -993,38 +1037,40 @@ const PAGE = `<!DOCTYPE html>
     state.skipped = sortByWhenMs(
       state.skipped.filter(function (s) { return s.id !== target.id; }).concat([optimisticSkipped])
     );
-    state.pendingCount += 1;
     render();
     setStatus(target.timeText + ' (' + target.deviceName + ') をスキップ中...', false);
 
-    requestJson('/api/alarms/skip', {
-      method: 'POST',
-      keepalive: true,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: target.id,
-        notificationIndex: target.notificationIndex,
-        notification: target.notification
-      })
-    }).then(function (data) {
-      delete state.pendingSkips[target.id];
-      state.pendingCount = Math.max(0, state.pendingCount - 1);
-      applyPayload(data);
-      render();
-      if (state.pendingCount === 0 && !state.hadMutationError) {
-        setStatus(target.timeText + ' の次回分をスキップしました', false);
+    enqueueMutation(async function (releasePending) {
+      try {
+        var data = await requestJson('/api/alarms/skip', {
+          method: 'POST',
+          keepalive: true,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: target.id,
+            notificationIndex: target.notificationIndex,
+            notification: target.notification
+          })
+        });
+        delete state.pendingSkips[target.id];
+        releasePending();
+        applyPayload(data);
+        render();
+        if (state.pendingCount === 0 && !state.hadMutationError) {
+          setStatus(target.timeText + ' の次回分をスキップしました', false);
+        }
+      } catch (e) {
+        state.hadMutationError = true;
+        delete state.pendingSkips[target.id];
+        releasePending();
+        if (e && e.needsLogin === true) {
+          enterLoginMode(e.loginUrl);
+          return;
+        }
+        setStatus('スキップエラー: ' + e.message, true);
+        await syncFromServerAfterError();
+        render();
       }
-    }).catch(async function (e) {
-      state.hadMutationError = true;
-      delete state.pendingSkips[target.id];
-      state.pendingCount = Math.max(0, state.pendingCount - 1);
-      if (e && e.needsLogin === true) {
-        enterLoginMode(e.loginUrl);
-        return;
-      }
-      setStatus('スキップエラー: ' + e.message, true);
-      await syncFromServerAfterError();
-      render();
     });
   }
 
@@ -1049,7 +1095,6 @@ const PAGE = `<!DOCTYPE html>
     state.active = sortByWhenMs(
       state.active.filter(function (a) { return !removeIds[a.id]; }).concat(addedActives)
     );
-    state.pendingCount += targets.length;
     render();
 
     if (targets.length === 1) {
@@ -1059,36 +1104,39 @@ const PAGE = `<!DOCTYPE html>
     }
 
     targets.forEach(function (target) {
-      requestJson('/api/alarms/restore', {
-        method: 'POST',
-        keepalive: true,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: target.id,
-          notificationIndex: target.notificationIndex,
-          originalDate: target.originalDate,
-          originalTime: target.originalTime,
-          notification: target.notification
-        })
-      }).then(function (data) {
-        delete state.pendingRestores[target.id];
-        state.pendingCount = Math.max(0, state.pendingCount - 1);
-        applyPayload(data);
-        render();
-        if (state.pendingCount === 0 && !state.hadMutationError) {
-          setStatus(doneMessage, false);
+      enqueueMutation(async function (releasePending) {
+        try {
+          var data = await requestJson('/api/alarms/restore', {
+            method: 'POST',
+            keepalive: true,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: target.id,
+              notificationIndex: target.notificationIndex,
+              originalDate: target.originalDate,
+              originalTime: target.originalTime,
+              notification: target.notification
+            })
+          });
+          delete state.pendingRestores[target.id];
+          releasePending();
+          applyPayload(data);
+          render();
+          if (state.pendingCount === 0 && !state.hadMutationError) {
+            setStatus(doneMessage, false);
+          }
+        } catch (e) {
+          state.hadMutationError = true;
+          delete state.pendingRestores[target.id];
+          releasePending();
+          if (e && e.needsLogin === true) {
+            enterLoginMode(e.loginUrl);
+            return;
+          }
+          setStatus('復活エラー: ' + e.message, true);
+          await syncFromServerAfterError();
+          render();
         }
-      }).catch(async function (e) {
-        state.hadMutationError = true;
-        delete state.pendingRestores[target.id];
-        state.pendingCount = Math.max(0, state.pendingCount - 1);
-        if (e && e.needsLogin === true) {
-          enterLoginMode(e.loginUrl);
-          return;
-        }
-        setStatus('復活エラー: ' + e.message, true);
-        await syncFromServerAfterError();
-        render();
       });
     });
   }
@@ -1145,6 +1193,13 @@ const PAGE = `<!DOCTYPE html>
     if (!btn) return;
     handleRestore(Number(btn.getAttribute('data-idx')));
   });
+  document.addEventListener('click', function (event) {
+    if (event.detail <= 0) return;
+    var target = event.target && event.target.closest ? event.target.closest('button') : null;
+    if (target && typeof target.blur === 'function') {
+      target.blur();
+    }
+  });
 
   function sendHeartbeat() {
     fetch('/api/heartbeat').catch(function () {});
@@ -1175,13 +1230,15 @@ const PAGE = `<!DOCTYPE html>
     }
   }
 
-  window.addEventListener('keydown', function (e) {
-    if (e.altKey && e.key === 'F4') {
-      sendShutdownBeacon();
-    }
-  });
-  window.addEventListener('pagehide', sendShutdownBeacon);
-  window.addEventListener('beforeunload', sendShutdownBeacon);
+  if (!DESKTOP_HOST_MODE) {
+    window.addEventListener('keydown', function (e) {
+      if (e.altKey && e.key === 'F4') {
+        sendShutdownBeacon();
+      }
+    });
+    window.addEventListener('pagehide', sendShutdownBeacon);
+    window.addEventListener('beforeunload', sendShutdownBeacon);
+  }
 
   loadAlarms({ silent: false });
   startAutoRefresh();
@@ -1200,7 +1257,7 @@ let ipv6Server = null;
 const windowManager = createWindowManager({
   getServers: () => [ipv6Server, server],
   isBusy: () => pendingServerMutations > 0 || activeApiRequests > 0 || authManager.getAuthState().status === 'logging_in',
-  hasPendingWork: () => pendingServerMutations > 0 || activeApiRequests > 0 || authManager.getAuthState().status === 'logging_in',
+  hasPendingWork: () => pendingServerMutations > 0 || activeApiRequests > 0,
 });
 
 function enqueueServerMutation(fn) {
@@ -1227,7 +1284,7 @@ async function runApiRoute(res, handler) {
     if (!res.headersSent) {
       if (isAuthError(err)) {
         try {
-          await authManager.startProxyLogin({ notify: APP_MODE });
+          await authManager.startProxyLogin({ notify: APP_MODE || DESKTOP_HOST_MODE });
         } catch (loginErr) {
           console.error('[Auth] Failed to start proxy login:', loginErr && loginErr.stack ? loginErr.stack : loginErr);
         }
@@ -1380,8 +1437,15 @@ function listenServer(port) {
 
   server.listen(port, HOST, () => {
     const actualPort = server.address().port;
-    windowManager.writeSingleInstanceLock(actualPort);
+    if (!DESKTOP_HOST_MODE) {
+      windowManager.writeSingleInstanceLock(actualPort);
+    }
     listenIpv6Loopback(actualPort);
+    if (DESKTOP_HOST_MODE) {
+      process.stdout.write(`${DESKTOP_HOST_READY_PREFIX}${JSON.stringify({ port: actualPort })}\n`);
+      windowManager.startHeartbeatWatchdog();
+      return;
+    }
     console.log(`Alexa アラーム管理アプリが起動しました: http://localhost:${actualPort}/`);
     if (APP_MODE) {
       console.log('アプリウィンドウ（Google Chrome）を起動しています。ウィンドウを閉じるとサーバーも終了します。');
@@ -1399,21 +1463,25 @@ if (require.main === module) {
   process.on('unhandledRejection', (reason) => {
     console.error('[FatalGuard] unhandledRejection:', reason && reason.stack ? reason.stack : reason);
   });
-  process.on('exit', windowManager.releaseSingleInstanceLock);
   process.on('SIGINT', () => windowManager.shutdownServer('SIGINT'));
   process.on('SIGTERM', () => windowManager.shutdownServer('SIGTERM'));
-  windowManager.acquireSingleInstanceLock()
-    .then((acquired) => {
-      if (!acquired) {
-        console.log('すでに Alexa アラーム管理アプリが起動しています。既存ウィンドウを表示します。');
-        process.exit(0);
-      }
-      listenServer(DEFAULT_PORT);
-    })
-    .catch((err) => {
-      console.error('起動ロック確認エラー:', err && err.message ? err.message : err);
-      listenServer(DEFAULT_PORT);
-    });
+  if (DESKTOP_HOST_MODE) {
+    listenServer(DEFAULT_PORT);
+  } else {
+    process.on('exit', windowManager.releaseSingleInstanceLock);
+    windowManager.acquireSingleInstanceLock()
+      .then((acquired) => {
+        if (!acquired) {
+          console.log('すでに Alexa アラーム管理アプリが起動しています。既存ウィンドウを表示します。');
+          process.exit(0);
+        }
+        listenServer(DEFAULT_PORT);
+      })
+      .catch((err) => {
+        console.error('起動ロック確認エラー:', err && err.message ? err.message : err);
+        listenServer(DEFAULT_PORT);
+      });
+  }
 }
 
 module.exports = {

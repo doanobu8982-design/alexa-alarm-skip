@@ -21,6 +21,7 @@ const {
   AuthRequiredError,
   createAlexaAuthManager,
   isAuthError,
+  prepareCookieForAlexaRemote,
 } = require('../src/core/alexa-auth');
 const {
   buildWidgetSummary,
@@ -28,7 +29,12 @@ const {
   createAlarmService,
 } = require('../src/core/alarm-service');
 const { applyProxyPatch, patchedLookup, upstreamAgent } = require('../src/core/proxy-patch');
-const { createWindowManager } = require('../src/desktop/window-manager');
+const {
+  DEFAULT_APP_WINDOW_HEIGHT,
+  DEFAULT_APP_WINDOW_WIDTH,
+  createWindowManager,
+  resetChromeWindowPlacement,
+} = require('../src/desktop/window-manager');
 
 function createTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'alexa-alarm-test-'));
@@ -554,9 +560,45 @@ describe('prototype/web-ui.js HTTP integration', () => {
     assert.match(html.headers['content-type'], /text\/html/);
     assert.match(html.body, /Alexa アラーム管理/);
 
+    const idx256 = html.body.indexOf('href="/icon-256.png"');
+    const idx48 = html.body.indexOf('href="/icon-48.png"');
+    const idx32 = html.body.indexOf('href="/icon-32.png"');
+    const idxIco = html.body.indexOf('href="/favicon.ico"');
+    assert.ok(idx256 > 0 && idx48 > idx256 && idx32 > idx48 && idxIco > idx32, 'icon links should be ordered high-res first');
+
     const manifest = await fetchJson('/manifest.webmanifest');
     assert.equal(manifest.status, 200);
     assert.equal(manifest.body.short_name, 'Alexaアラーム');
+    assert.deepEqual(
+      manifest.body.icons.map((i) => ({ src: i.src, sizes: i.sizes, purpose: i.purpose })),
+      [
+        { src: '/icon-48.png', sizes: '48x48', purpose: 'any' },
+        { src: '/icon-192.png', sizes: '192x192', purpose: 'any' },
+        { src: '/icon-256.png', sizes: '256x256', purpose: 'any' },
+      ]
+    );
+
+    for (const [route, mime] of [
+      ['/icon-256.png', 'image/png'],
+      ['/icon-192.png', 'image/png'],
+      ['/icon-48.png', 'image/png'],
+      ['/icon-32.png', 'image/png'],
+      ['/favicon.ico', 'image/x-icon'],
+    ]) {
+      const res = await fetchJson(route, { raw: true });
+      assert.equal(res.status, 200, `${route} should return 200`);
+      assert.equal(res.headers['content-type'], mime);
+    }
+
+    const icoBuf = fs.readFileSync(path.join(__dirname, '..', 'assets', 'icons', 'app.ico'));
+    const icoCount = icoBuf.readUInt16LE(4);
+    assert.equal(icoCount, 8);
+    const icoWidths = [];
+    for (let i = 0; i < icoCount; i++) {
+      const rawW = icoBuf.readUInt8(6 + i * 16);
+      icoWidths.push(rawW === 0 ? 256 : rawW);
+    }
+    assert.deepEqual(icoWidths, [16, 24, 32, 40, 48, 64, 128, 256]);
 
     const notFound = await fetchJson('/nonexistent', { raw: true });
     assert.equal(notFound.status, 404);
@@ -782,6 +824,390 @@ describe('proxy-patch.js', () => {
       dns.lookup = origLookup;
       dns.Resolver.prototype.resolve4 = origResolve4;
     }
+  });
+});
+
+describe('prototype/web-ui.js --desktop-host mode', () => {
+  it('outputs __ALEXA_HOST_READY__ port JSON, disables beforeunload shutdown in HTML, and exits 0 on POST /api/shutdown', async () => {
+    const { spawn } = require('node:child_process');
+    const vm = require('vm');
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'alexa-desktop-host-test-'));
+    const cookiePath = path.join(tempDir, 'missing-cookie.json');
+    const scriptPath = path.join(__dirname, '..', 'prototype', 'web-ui.js');
+
+    const child = spawn(process.execPath, [scriptPath, '--desktop-host'], {
+      env: {
+        ...process.env,
+        ALEXA_WEB_PORT: '0',
+        ALEXA_COOKIE_FILE: cookiePath,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+      const readyPayload = await new Promise((resolve, reject) => {
+        let stdoutBuf = '';
+        let stderrBuf = '';
+        const timer = setTimeout(() => {
+          reject(new Error(`Timed out waiting for __ALEXA_HOST_READY__. stdout=${stdoutBuf} stderr=${stderrBuf}`));
+        }, 10000);
+
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
+        child.stdout.on('data', (chunk) => {
+          stdoutBuf += chunk;
+          const lines = stdoutBuf.split(/\r?\n/);
+          for (const line of lines) {
+            if (line.startsWith('__ALEXA_HOST_READY__ ')) {
+              clearTimeout(timer);
+              resolve(JSON.parse(line.slice('__ALEXA_HOST_READY__ '.length)));
+              return;
+            }
+          }
+        });
+        child.stderr.on('data', (chunk) => {
+          stderrBuf += chunk;
+        });
+        child.once('exit', (code) => {
+          clearTimeout(timer);
+          reject(new Error(`Child exited prematurely with code ${code}. stdout=${stdoutBuf} stderr=${stderrBuf}`));
+        });
+      });
+
+      assert.equal(Number.isInteger(readyPayload.port), true);
+      assert.ok(readyPayload.port > 0 && readyPayload.port <= 65535);
+
+      const html = await new Promise((resolve, reject) => {
+        http.get(`http://127.0.0.1:${readyPayload.port}/`, (res) => {
+          assert.equal(res.statusCode, 200);
+          let raw = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => { raw += c; });
+          res.on('end', () => resolve(raw));
+        }).on('error', reject);
+      });
+
+      assert.match(html, /data-desktop-host="1"/);
+
+      const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+      assert.ok(scriptMatch, 'Expected inline <script> in --desktop-host HTML');
+      const windowListeners = {};
+      const beaconUrls = [];
+      const noopEl = {
+        textContent: '',
+        title: '',
+        className: '',
+        hidden: false,
+        disabled: false,
+        innerHTML: '',
+        classList: { add() {}, remove() {} },
+        setAttribute() {},
+        addEventListener() {},
+      };
+      vm.runInNewContext(scriptMatch[1], {
+        window: {
+          location: { origin: `http://127.0.0.1:${readyPayload.port}` },
+          open() {},
+          addEventListener(type, fn) { windowListeners[type] = fn; },
+        },
+        document: {
+          visibilityState: 'visible',
+          documentElement: {
+            getAttribute: (attr) => (attr === 'data-desktop-host' ? '1' : null),
+          },
+          getElementById: () => noopEl,
+          addEventListener() {},
+        },
+        navigator: {
+          sendBeacon: (url) => {
+            beaconUrls.push(url);
+            return true;
+          },
+        },
+        console,
+        setInterval: () => 1,
+        clearInterval: () => {},
+        fetch: () => Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ active: [], skipped: [], deviceCount: 0, checkedAt: '00:00:00' }),
+        }),
+      });
+
+      assert.equal(windowListeners.beforeunload, undefined);
+      assert.equal(windowListeners.pagehide, undefined);
+      assert.equal(windowListeners.keydown, undefined);
+      assert.deepEqual(beaconUrls, []);
+
+      const exitPromise = new Promise((resolve) => {
+        child.once('exit', (code, signal) => resolve({ code, signal }));
+      });
+
+      await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: readyPayload.port,
+          path: '/api/shutdown',
+          method: 'POST',
+        }, (res) => {
+          assert.equal(res.statusCode, 200);
+          res.resume();
+          res.on('end', resolve);
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+      const exitResult = await exitPromise;
+      assert.equal(exitResult.code, 0);
+    } finally {
+      if (child.exitCode === null && !child.killed) {
+        child.kill('SIGKILL');
+      }
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/shutdown drains hasPendingWork before exiting with code 0', async () => {
+    const { spawn } = require('node:child_process');
+    const inlineCode = `
+      const http = require('http');
+      const { createWindowManager } = require('./src/desktop/window-manager');
+      let pending = true;
+      setTimeout(() => { pending = false; }, 180);
+      const srv = http.createServer((req, res) => {
+        if (req.url === '/api/shutdown' && req.method === 'POST') {
+          res.on('finish', () => wm.shutdownServer('beforeunload'));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      const wm = createWindowManager({
+        getServers: () => [srv],
+        hasPendingWork: () => pending,
+      });
+      srv.listen(0, '127.0.0.1', () => {
+        process.stdout.write('PORT:' + srv.address().port + '\\n');
+      });
+    `;
+
+    const child = spawn(process.execPath, ['-e', inlineCode], {
+      cwd: path.join(__dirname, '..'),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+      const port = await new Promise((resolve, reject) => {
+        let buf = '';
+        const timer = setTimeout(() => reject(new Error('Timed out waiting for PORT')), 5000);
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', (chunk) => {
+          buf += chunk;
+          const m = buf.match(/PORT:(\d+)/);
+          if (m) {
+            clearTimeout(timer);
+            resolve(Number(m[1]));
+          }
+        });
+        child.once('exit', (code) => {
+          clearTimeout(timer);
+          reject(new Error(`Child exited early with ${code}`));
+        });
+      });
+
+      const startedAt = Date.now();
+      const exitPromise = new Promise((resolve) => {
+        child.once('exit', (code) => resolve({ code, elapsedMs: Date.now() - startedAt }));
+      });
+
+      await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port,
+          path: '/api/shutdown',
+          method: 'POST',
+        }, (res) => {
+          assert.equal(res.statusCode, 200);
+          res.resume();
+          res.on('end', resolve);
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+      const { code, elapsedMs } = await exitPromise;
+      assert.equal(code, 0);
+      assert.ok(elapsedMs >= 140, `Expected drain delay >= 140ms, got ${elapsedMs}ms`);
+    } finally {
+      if (child.exitCode === null && !child.killed) {
+        child.kill('SIGKILL');
+      }
+    }
+  });
+
+  it('exits promptly with code 0 on POST /api/shutdown even while auth state is logging_in', async () => {
+    const { spawn } = require('node:child_process');
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'alexa-desktop-login-shutdown-'));
+    const cookiePath = path.join(tempDir, 'missing-cookie.json');
+    const scriptPath = path.join(__dirname, '..', 'prototype', 'web-ui.js');
+
+    const child = spawn(process.execPath, [scriptPath, '--desktop-host'], {
+      env: {
+        ...process.env,
+        ALEXA_WEB_PORT: '0',
+        ALEXA_COOKIE_FILE: cookiePath,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+      const readyPayload = await new Promise((resolve, reject) => {
+        let stdoutBuf = '';
+        let stderrBuf = '';
+        const timer = setTimeout(() => {
+          reject(new Error(`Timed out waiting for __ALEXA_HOST_READY__. stdout=${stdoutBuf} stderr=${stderrBuf}`));
+        }, 10000);
+
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
+        child.stdout.on('data', (chunk) => {
+          stdoutBuf += chunk;
+          for (const line of stdoutBuf.split(/\r?\n/)) {
+            if (line.startsWith('__ALEXA_HOST_READY__ ')) {
+              clearTimeout(timer);
+              resolve(JSON.parse(line.slice('__ALEXA_HOST_READY__ '.length)));
+              return;
+            }
+          }
+        });
+        child.stderr.on('data', (chunk) => {
+          stderrBuf += chunk;
+        });
+        child.once('exit', (code) => {
+          clearTimeout(timer);
+          reject(new Error(`Child exited prematurely with code ${code}. stdout=${stdoutBuf} stderr=${stderrBuf}`));
+        });
+      });
+
+      const loginPayload = await new Promise((resolve, reject) => {
+        const body = JSON.stringify({ openBrowser: false });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: readyPayload.port,
+          path: '/api/auth/login',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+          },
+        }, (res) => {
+          let raw = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => { raw += c; });
+          res.on('end', () => resolve({ statusCode: res.statusCode, json: JSON.parse(raw) }));
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+      });
+
+      assert.equal(loginPayload.statusCode, 200);
+      assert.equal(loginPayload.json.status, 'logging_in');
+
+      const startedAt = Date.now();
+      const exitPromise = new Promise((resolve) => {
+        child.once('exit', (code) => resolve({ code, elapsedMs: Date.now() - startedAt }));
+      });
+
+      await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: readyPayload.port,
+          path: '/api/shutdown',
+          method: 'POST',
+        }, (res) => {
+          assert.equal(res.statusCode, 200);
+          res.resume();
+          res.on('end', resolve);
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+      const { code, elapsedMs } = await exitPromise;
+      assert.equal(code, 0);
+      assert.ok(elapsedMs < 3000, `Expected shutdown while logging_in < 3000ms, got ${elapsedMs}ms`);
+    } finally {
+      if (child.exitCode === null && !child.killed) {
+        child.kill('SIGKILL');
+      }
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('serves focus-visible CSS and mouse click blur handler to prevent focus ring on mouse clicks', async () => {
+    const vm = require('vm');
+    const { handleRequest: webUiHandleRequest } = require('../prototype/web-ui');
+    const html = await new Promise((resolve, reject) => {
+      const srv = http.createServer(webUiHandleRequest);
+      srv.listen(0, '127.0.0.1', () => {
+        const port = srv.address().port;
+        http.get(`http://127.0.0.1:${port}/`, (res) => {
+          assert.equal(res.statusCode, 200);
+          let raw = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => { raw += c; });
+          res.on('end', () => srv.close(() => resolve(raw)));
+        }).on('error', reject);
+      });
+    });
+
+    assert.match(html, /button:focus[\s\S]*outline:\s*none;/);
+    assert.match(html, /button:focus-visible[\s\S]*outline:\s*2px solid/);
+
+    const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+    assert.ok(scriptMatch, 'Expected inline <script> in HTML');
+
+    const docListeners = {};
+    const noopEl = {
+      textContent: '',
+      title: '',
+      className: '',
+      hidden: false,
+      disabled: false,
+      innerHTML: '',
+      classList: { add() {}, remove() {} },
+      setAttribute() {},
+      addEventListener() {},
+    };
+    vm.runInNewContext(scriptMatch[1], {
+      window: { location: { origin: 'http://127.0.0.1' }, open() {}, addEventListener() {} },
+      document: {
+        visibilityState: 'visible',
+        getElementById: () => noopEl,
+        addEventListener(type, fn) { docListeners[type] = fn; },
+      },
+      navigator: { sendBeacon: () => true },
+      console,
+      setInterval: () => 1,
+      clearInterval: () => {},
+      fetch: () => Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ active: [], skipped: [], deviceCount: 0, checkedAt: '00:00:00' }),
+      }),
+    });
+
+    assert.equal(typeof docListeners.click, 'function');
+    let blurCount = 0;
+    const mockBtn = { blur() { blurCount += 1; } };
+    docListeners.click({ detail: 1, target: { closest: (sel) => (sel === 'button' ? mockBtn : null) } });
+    assert.equal(blurCount, 1);
+    docListeners.click({ detail: 0, target: { closest: (sel) => (sel === 'button' ? mockBtn : null) } });
+    assert.equal(blurCount, 1);
   });
 });
 
@@ -1028,7 +1454,7 @@ describe('alexa-auth.js listener cleanup & UI loading/auto-refresh', () => {
     // Skip remaining tomorrow alarm -> overall .empty only
     elements.timelineList._listeners.click(makeSkipClick(0));
     const afterAllSkipped = elements.timelineList.innerHTML;
-    assert.ok(afterAllSkipped.includes('<div class="empty">直近24時間以内の ON アラームはありません</div>'));
+    assert.ok(afterAllSkipped.includes('<div class="empty">直近のアラームはありません</div>'));
     assert.equal(afterAllSkipped.includes('empty-group'), false);
     assert.equal(afterAllSkipped.includes('date-divider'), false);
 
@@ -1105,5 +1531,471 @@ describe('alexa-auth.js listener cleanup & UI loading/auto-refresh', () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it('prepareCookieForAlexaRemote preserves cookieData.refreshToken on real alexa-remote2 setCookie', () => {
+    const AlexaRemote = require('alexa-remote2');
+    const remote = new AlexaRemote();
+    remote._options = {};
+    const rawCookie = {
+      cookie: 'session-id=123; csrf=abc',
+      localCookie: 'session-id=123; csrf=abc',
+      refreshToken: 'Atnr|test-refresh-token',
+      macDms: { device_private_key: 'k', adp_token: 't' },
+    };
+
+    const prepared = prepareCookieForAlexaRemote(rawCookie);
+    assert.equal('cookie' in prepared, false);
+    assert.equal(prepared.localCookie, 'session-id=123; csrf=abc');
+    assert.equal(rawCookie.cookie, 'session-id=123; csrf=abc');
+
+    remote.setCookie(prepared);
+    assert.ok(remote.cookieData);
+    assert.equal(remote.cookieData.refreshToken, 'Atnr|test-refresh-token');
+  });
+
+  it('connectAlexa reloads cookieFile automatically when mtime/size changes on disk', async () => {
+    const tmpDir = createTempDir();
+    try {
+      const cookieFile = path.join(tmpDir, 'alexa-cookie.json');
+      fs.writeFileSync(cookieFile, JSON.stringify({
+        localCookie: 'session=v1; csrf=c1',
+        refreshToken: 'Atnr|v1',
+        macDms: { k: 1 },
+      }), 'utf8');
+
+      const seenCookies = [];
+      class MockAlexa {
+        on() {}
+        removeAllListeners() {}
+        init(opts, cb) {
+          seenCookies.push(opts.cookie.localCookie);
+          process.nextTick(() => cb(null));
+        }
+      }
+
+      const authManager = createAlexaAuthManager({ cookieFile, AlexaRemoteClass: MockAlexa });
+      await authManager.connectAlexa();
+      assert.deepEqual(seenCookies, ['session=v1; csrf=c1']);
+
+      await new Promise((r) => setTimeout(r, 30));
+      fs.writeFileSync(cookieFile, JSON.stringify({
+        localCookie: 'session=v2-updated; csrf=c2',
+        refreshToken: 'Atnr|v2-updated',
+        macDms: { k: 2 },
+      }), 'utf8');
+
+      await authManager.connectAlexa();
+      assert.deepEqual(seenCookies, ['session=v1; csrf=c1', 'session=v2-updated; csrf=c2']);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('connectAlexa does not re-initialize when saveCookieData writes during init cookie event', async () => {
+    const tmpDir = createTempDir();
+    try {
+      const cookieFile = path.join(tmpDir, 'alexa-cookie.json');
+      fs.writeFileSync(cookieFile, JSON.stringify({
+        localCookie: 'session=v1; csrf=c1',
+        refreshToken: 'Atnr|v1',
+        macDms: { k: 1 },
+      }), 'utf8');
+
+      let initCount = 0;
+      class CookieEmittingAlexa extends EventEmitter {
+        init(opts, cb) {
+          initCount += 1;
+          this.cookieData = { ...opts.cookie, extraField: `init-${initCount}` };
+          this.emit('cookie', this.cookieData);
+          process.nextTick(() => cb(null));
+        }
+        removeAllListeners() {
+          super.removeAllListeners();
+        }
+      }
+
+      const authManager = createAlexaAuthManager({ cookieFile, AlexaRemoteClass: CookieEmittingAlexa });
+      await authManager.connectAlexa();
+      assert.equal(initCount, 1);
+
+      // 2nd connectAlexa should reuse existing connection without re-init
+      await authManager.connectAlexa();
+      assert.equal(initCount, 1);
+
+      // External update should still trigger reconnect
+      await new Promise((r) => setTimeout(r, 30));
+      fs.writeFileSync(cookieFile, JSON.stringify({
+        localCookie: 'session=external-v2; csrf=c2',
+        refreshToken: 'Atnr|external-v2',
+        macDms: { k: 2 },
+      }), 'utf8');
+      await authManager.connectAlexa();
+      assert.equal(initCount, 2);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('alarmService.skipAlarm retries once from disk on first auth error and throws AuthRequiredError only after 2nd auth failure', async () => {
+    const tmpDir = createTempDir();
+    try {
+      const cookieFile = path.join(tmpDir, 'alexa-cookie.json');
+      fs.writeFileSync(cookieFile, JSON.stringify({
+        localCookie: 'session=ok; csrf=c1',
+        refreshToken: 'Atnr|ok',
+        macDms: { k: 1 },
+      }), 'utf8');
+
+      let cancelAttempts = 0;
+      const soonIso = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      class MockAlexa {
+        constructor() {
+          this.endpoints = { alexaApiUrl: 'https://alexa.amazon.co.jp' };
+        }
+        on() {}
+        removeAllListeners() {}
+        init(opts, cb) { process.nextTick(() => cb(null)); }
+        getDevices(cb) { process.nextTick(() => cb(null, { devices: [] })); }
+        getNotifications(cached, cb) {
+          process.nextTick(() => cb(null, {
+            notifications: [{
+              notificationIndex: 'a-1',
+              type: 'Alarm',
+              status: 'ON',
+              trigger: { scheduledTime: soonIso },
+            }],
+          }));
+        }
+        cancelNotification(n, cb) {
+          cancelAttempts += 1;
+          if (cancelAttempts === 1) {
+            process.nextTick(() => cb(new Error('401 Unauthorized')));
+            return;
+          }
+          process.nextTick(() => cb(null));
+        }
+      }
+
+      const authManager = createAlexaAuthManager({ cookieFile, AlexaRemoteClass: MockAlexa });
+      const alarmService = createAlarmService(authManager);
+
+      const res = await alarmService.skipAlarm({ id: 'a-1' });
+      assert.equal(res.ok, true);
+      assert.equal(cancelAttempts, 2);
+
+      // Always fail with 401 -> throws AuthRequiredError after 1 retry (2 more attempts)
+      cancelAttempts = 0;
+      class AlwaysFailAlexa extends MockAlexa {
+        cancelNotification(n, cb) {
+          cancelAttempts += 1;
+          process.nextTick(() => cb(new Error('401 Unauthorized')));
+        }
+      }
+      const failAuth = createAlexaAuthManager({ cookieFile, AlexaRemoteClass: AlwaysFailAlexa });
+      const failService = createAlarmService(failAuth);
+      await assert.rejects(() => failService.skipAlarm({ id: 'a-1' }), (err) => err instanceof AuthRequiredError);
+      assert.equal(cancelAttempts, 2);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('resetChromeWindowPlacement preserves last position, resets size, cleans Sessions, and handles missing/corrupt files', () => {
+    const tmpDir = createTempDir();
+    try {
+      assert.equal(DEFAULT_APP_WINDOW_WIDTH, 420);
+      assert.equal(DEFAULT_APP_WINDOW_HEIGHT, 720);
+
+      // Missing Preferences -> no throw, returns default { left: 80, top: 80 }
+      assert.deepEqual(resetChromeWindowPlacement(tmpDir, 420, 720), { left: 80, top: 80 });
+
+      const defaultDir = path.join(tmpDir, 'Default');
+      const sessionsDir = path.join(defaultDir, 'Sessions');
+      fs.mkdirSync(sessionsDir, { recursive: true });
+      fs.writeFileSync(path.join(sessionsDir, 'Apps_123'), 'x', 'utf8');
+      fs.writeFileSync(path.join(sessionsDir, 'Tabs_456'), 'x', 'utf8');
+      fs.writeFileSync(path.join(sessionsDir, 'Session_789'), 'x', 'utf8');
+      fs.writeFileSync(path.join(sessionsDir, 'README.txt'), 'keep', 'utf8');
+
+      const prefsPath = path.join(defaultDir, 'Preferences');
+
+      // Corrupt JSON -> no throw, cleans Sessions and returns default { left: 80, top: 80 }
+      fs.writeFileSync(prefsPath, '{not-json', 'utf8');
+      assert.deepEqual(resetChromeWindowPlacement(tmpDir, 420, 720), { left: 80, top: 80 });
+      assert.equal(fs.existsSync(path.join(sessionsDir, 'Apps_123')), false);
+      assert.equal(fs.existsSync(path.join(sessionsDir, 'Tabs_456')), false);
+      assert.equal(fs.existsSync(path.join(sessionsDir, 'Session_789')), false);
+      assert.equal(fs.existsSync(path.join(sessionsDir, 'README.txt')), true);
+
+      // Valid Preferences with app_window_placement (230, 49, 1296x861)
+      fs.writeFileSync(prefsPath, JSON.stringify({
+        profile: { name: 'AppUser' },
+        browser: {
+          has_seen_welcome_page: true,
+          app_window_placement: {
+            127: {
+              0: {
+                0: {
+                  '1_/': {
+                    left: 230,
+                    top: 49,
+                    right: 1526,
+                    bottom: 910,
+                    maximized: false,
+                    work_area_left: 0,
+                    work_area_top: 0,
+                    work_area_right: 1920,
+                    work_area_bottom: 1032,
+                  },
+                },
+              },
+            },
+          },
+          window_placement: {
+            left: 100,
+            top: 50,
+            right: 900,
+            bottom: 850,
+            maximized: true,
+          },
+        },
+      }), 'utf8');
+
+      assert.deepEqual(resetChromeWindowPlacement(tmpDir, 420, 720), { left: 230, top: 49 });
+      const updated = JSON.parse(fs.readFileSync(prefsPath, 'utf8'));
+      assert.equal(updated.profile.name, 'AppUser');
+      assert.equal(updated.browser.has_seen_welcome_page, true);
+      assert.deepEqual(updated.browser.window_placement, {
+        work_area_left: 0,
+        work_area_top: 0,
+        work_area_right: 1920,
+        work_area_bottom: 1032,
+        left: 230,
+        top: 49,
+        right: 650,
+        bottom: 769,
+        maximized: false,
+      });
+      assert.deepEqual(updated.browser.app_window_placement['127']['0']['0']['1_/'], {
+        work_area_left: 0,
+        work_area_top: 0,
+        work_area_right: 1920,
+        work_area_bottom: 1032,
+        left: 230,
+        top: 49,
+        right: 650,
+        bottom: 769,
+        maximized: false,
+      });
+
+      // Off-screen coordinates clamped into work_area
+      fs.writeFileSync(prefsPath, JSON.stringify({
+        browser: {
+          app_window_placement: {
+            127: { 0: { 0: { '1_/': { left: 1800, top: 900, right: 2220, bottom: 1620, work_area_left: 0, work_area_top: 0, work_area_right: 1920, work_area_bottom: 1032 } } } },
+          },
+        },
+      }), 'utf8');
+      assert.deepEqual(resetChromeWindowPlacement(tmpDir, 420, 720), { left: 1500, top: 312 });
+
+      // Minimized invalid coordinates (-32000) -> reset to default (80, 80)
+      fs.writeFileSync(prefsPath, JSON.stringify({
+        browser: {
+          app_window_placement: {
+            127: { 0: { 0: { '1_/': { left: -32000, top: -32000, right: -31580, bottom: -31280 } } } },
+          },
+        },
+      }), 'utf8');
+      assert.deepEqual(resetChromeWindowPlacement(tmpDir, 420, 720), { left: 80, top: 80 });
+
+      // Valid multi-monitor negative coordinates preserved within negative work_area
+      fs.writeFileSync(prefsPath, JSON.stringify({
+        browser: {
+          app_window_placement: {
+            127: { 0: { 0: { '1_/': { left: -800, top: 100, right: -380, bottom: 820, work_area_left: -1920, work_area_top: 0, work_area_right: 0, work_area_bottom: 1080 } } } },
+          },
+        },
+      }), 'utf8');
+      assert.deepEqual(resetChromeWindowPlacement(tmpDir, 420, 720), { left: -800, top: 100 });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('launchAppBrowser passes --window-position, --window-size, and --disable-session-crashed-bubble to Chrome', async () => {
+    const tmpDir = createTempDir();
+    try {
+      const defaultDir = path.join(tmpDir, 'Default');
+      fs.mkdirSync(defaultDir, { recursive: true });
+      fs.writeFileSync(path.join(defaultDir, 'Preferences'), JSON.stringify({
+        browser: {
+          app_window_placement: {
+            127: { 0: { 0: { '1_/': { left: 230, top: 49, right: 1526, bottom: 910, work_area_left: 0, work_area_top: 0, work_area_right: 1920, work_area_bottom: 1032 } } } },
+          },
+        },
+      }), 'utf8');
+
+      let capturedCmd = '';
+      const origExit = process.exit;
+      process.exit = () => {};
+      try {
+        const wm = createWindowManager({
+          userDataDir: tmpDir,
+          exec: (cmd) => { capturedCmd = cmd; },
+        });
+        wm.launchAppBrowser(54321);
+        await wm.shutdownServer('test-cleanup');
+      } finally {
+        process.exit = origExit;
+      }
+
+      assert.match(capturedCmd, /--window-position=230,49/);
+      assert.match(capturedCmd, /--window-size=420,720/);
+      assert.match(capturedCmd, /--disable-session-crashed-bubble/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('prototype/web-ui.js serializes rapid skip and restoreAll mutations, isolates errors, and prevents mid-queue disappearance', async () => {
+    const vm = require('vm');
+    const { handleRequest: webUiHandleRequest } = require('../prototype/web-ui');
+    const htmlRes = await new Promise((resolve, reject) => {
+      const srv = http.createServer(webUiHandleRequest);
+      srv.listen(0, '127.0.0.1', () => {
+        const port = srv.address().port;
+        http.get(`http://127.0.0.1:${port}/`, (res) => {
+          let raw = '';
+          res.on('data', (c) => { raw += c; });
+          res.on('end', () => { srv.close(() => resolve(raw)); });
+        }).on('error', reject);
+      });
+    });
+
+    const scriptMatch = htmlRes.match(/<script>([\s\S]*?)<\/script>/);
+    assert.ok(scriptMatch);
+    const scriptCode = scriptMatch[1];
+
+    const makeEl = () => ({
+      textContent: '',
+      title: '',
+      className: '',
+      hidden: false,
+      disabled: false,
+      innerHTML: '',
+      _listeners: {},
+      classList: { add() {}, remove() {} },
+      setAttribute() {},
+      addEventListener(type, fn) { this._listeners[type] = fn; },
+    });
+    const elements = {
+      statusBar: makeEl(),
+      loadingOverlay: makeEl(),
+      metaText: makeEl(),
+      loginCard: makeEl(),
+      timelineList: makeEl(),
+      skippedList: makeEl(),
+      tabActiveBtn: makeEl(),
+      tabSkippedBtn: makeEl(),
+      activeCountText: makeEl(),
+      skippedCountText: makeEl(),
+      panelActive: makeEl(),
+      panelSkipped: makeEl(),
+      restoreAllBtn: makeEl(),
+      refreshBtn: makeEl(),
+      openLoginBtn: makeEl(),
+    };
+
+    const a1 = {
+      id: 'a-1', notificationIndex: 'a-1', deviceName: 'Echo', type: 'Alarm', label: '',
+      recurringText: '毎日', originalDate: '2026-11-20', originalTime: '08:00:00.000',
+      timeText: '08:00', dayBadge: '明日 (金)', dateLabel: '明日 11/20 (金)', dateKey: '2026-11-20', whenMs: 1000,
+    };
+    const a2 = {
+      id: 'a-2', notificationIndex: 'a-2', deviceName: 'Echo', type: 'Alarm', label: '',
+      recurringText: '毎日', originalDate: '2026-11-20', originalTime: '08:30:00.000',
+      timeText: '08:30', dayBadge: '明日 (金)', dateLabel: '明日 11/20 (金)', dateKey: '2026-11-20', whenMs: 2000,
+    };
+
+    let inFlightCount = 0;
+    let maxInFlight = 0;
+    const mutationRequests = [];
+    const deferred = [];
+
+    vm.runInNewContext(scriptCode, {
+      window: { location: { origin: 'http://127.0.0.1' }, open() {}, addEventListener() {} },
+      document: {
+        visibilityState: 'visible',
+        getElementById: (id) => elements[id] || makeEl(),
+        addEventListener() {},
+      },
+      navigator: { sendBeacon: () => true },
+      console,
+      setInterval: () => 1,
+      clearInterval: () => {},
+      fetch: (url, opts) => {
+        if (url === '/api/heartbeat') {
+          return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true }) });
+        }
+        if (url === '/api/alarms') {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({ active: [a1, a2], skipped: [], deviceCount: 1, checkedAt: '10:00:00' }),
+          });
+        }
+        inFlightCount += 1;
+        maxInFlight = Math.max(maxInFlight, inFlightCount);
+        const body = JSON.parse(opts.body);
+        mutationRequests.push({ url, id: body.id });
+        return new Promise((resolve) => {
+          deferred.push({ url, id: body.id, resolve });
+        });
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Rapidly click skip twice (index 0 twice: a-1 then a-2)
+    elements.timelineList._listeners.click({
+      target: { closest: (sel) => (sel === 'button[data-action="skip"]' ? { getAttribute: () => '0' } : null) },
+    });
+    elements.timelineList._listeners.click({
+      target: { closest: (sel) => (sel === 'button[data-action="skip"]' ? { getAttribute: () => '0' } : null) },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+    // Serialized: only 1st request should have started while 1st is pending
+    assert.equal(maxInFlight, 1);
+    assert.equal(mutationRequests.length, 1);
+    assert.equal(mutationRequests[0].id, 'a-1');
+
+    // Fail 1st request (HTTP 500) -> 2nd request must still run, and a-2 must stay in skipped (not lost)
+    inFlightCount -= 1;
+    deferred[0].resolve({ ok: false, status: 500, json: async () => ({ error: 'boom' }) });
+    await new Promise((r) => setTimeout(r, 30));
+
+    assert.equal(maxInFlight, 1);
+    assert.equal(mutationRequests.length, 2);
+    assert.equal(mutationRequests[1].id, 'a-2');
+    assert.equal(elements.skippedList.innerHTML.includes('08:30'), true);
+
+    // Complete 2nd request -> mid-queue a-1 was rolled back, a-2 is skipped
+    inFlightCount -= 1;
+    deferred[1].resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        active: [a1],
+        skipped: [Object.assign({}, a2, { isSkipped: true })],
+        deviceCount: 1,
+        checkedAt: '10:00:02',
+      }),
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(elements.skippedList.innerHTML.includes('08:30'), true);
+    assert.equal(elements.timelineList.innerHTML.includes('08:00'), true);
   });
 });

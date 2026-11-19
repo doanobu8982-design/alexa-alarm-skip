@@ -1,26 +1,51 @@
+# Node.js
 node_modules/
-nodejs/node_modules/
-nodejs/src/
-www/nodejs/
-dist/
-build/
-test-results/
-alexa-cookie.json
-alexa-cookie.json.bak
-*.bak
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Secrets / Alexa session
 .env
 .env.*
-*.log
+alexa-cookie.json
+alexa-cookie.json.bak
+*.pem
+*.key
+
+# Build / Distribution
+dist/
+build/
+desktop/bin/
+desktop/obj/
+
+# Capacitor / Android
+.capacitor/
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+*.apk
+*.aab
+www/nodejs/
+nodejs/node_modules/
+
+# Android Release Signing Secrets
 *.jks
 *.keystore
 keystore.properties
 android/keystore/
 android/keystore.properties
-android/local.properties
-android/build/
-android/app/build/
-android/.gradle/
-android/app/src/main/assets/public/
-android/app/src/main/assets/builtin_modules/
-*.apk
-*.aab
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Test artifacts
+test-results/

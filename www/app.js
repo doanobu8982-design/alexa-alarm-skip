@@ -7,6 +7,8 @@
     skipped: [],
     loading: false,
     hasRenderedData: false,
+    deviceCount: 0,
+    checkedAt: '',
     todayGroupMeta: null,
     pendingCount: 0,
     hadMutationError: false,
@@ -34,7 +36,7 @@
       type: (target && target.type) || 'Alarm',
       originalDate: (target && target.originalDate) || '',
       originalTime: (target && target.originalTime) || '',
-      label: (target && target.label) || '',
+      label: sanitizeLabel(target && target.label),
       recurringPattern: (target && target.recurringPattern) || null,
       soundId: soundId,
       musicAlarmId: musicAlarmId,
@@ -64,6 +66,17 @@
     }
   }
 
+  async function releaseNativeInFlightMutation(opId) {
+    if (!isNative() || !opId) return;
+    var widgetPlugin = getCapacitorPlugin('AlarmWidget');
+    if (!widgetPlugin || typeof widgetPlugin.releaseInFlightMutation !== 'function') return;
+    try {
+      await widgetPlugin.releaseInFlightMutation({ opId: opId });
+    } catch (e) {
+      console.warn('[NativeQueue] releaseInFlightMutation failed:', e);
+    }
+  }
+
   function getCapacitorPlugin(name) {
     if (!window.Capacitor || !window.Capacitor.Plugins) return null;
     return window.Capacitor.Plugins[name] || null;
@@ -75,6 +88,13 @@
 
   function isNative() {
     return Boolean(window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform());
+  }
+
+  function sanitizeLabel(value) {
+    if (value == null) return '';
+    var trimmed = String(value).trim();
+    if (!trimmed || trimmed.toLowerCase() === 'null') return '';
+    return trimmed;
   }
 
   function escapeHtml(str) {
@@ -112,8 +132,9 @@
     var dayTagHtml = hideDayTag
       ? ''
       : '<span class="day-tag">' + escapeHtml(item.dayBadge || '') + '</span>';
-    var labelHtml = item.label
-      ? '<span class="alarm-label">' + escapeHtml(item.label) + '</span>'
+    var cleanLabel = sanitizeLabel(item && item.label);
+    var labelHtml = cleanLabel
+      ? '<span class="alarm-label">' + escapeHtml(cleanLabel) + '</span>'
       : '';
     var rowClass = isSkippedRow
       ? 'row row-skipped'
@@ -145,7 +166,7 @@
 
   function renderActiveTimeline(items) {
     if (!Array.isArray(items) || items.length === 0) {
-      return '<div class="empty">直近24時間以内の ON アラームはありません</div>';
+      return '<div class="empty">直近のアラームはありません</div>';
     }
     var parts = [];
     var currentDateKey = null;
@@ -344,8 +365,12 @@
   }
 
   function applyPayload(data) {
-    var serverActive = Array.isArray(data.active) ? data.active : [];
-    var serverSkipped = Array.isArray(data.skipped) ? data.skipped : [];
+    var serverActive = (Array.isArray(data.active) ? data.active : []).map(function (item) {
+      return item && typeof item === 'object' ? Object.assign({}, item, { label: sanitizeLabel(item.label) }) : item;
+    });
+    var serverSkipped = (Array.isArray(data.skipped) ? data.skipped : []).map(function (item) {
+      return item && typeof item === 'object' ? Object.assign({}, item, { label: sanitizeLabel(item.label) }) : item;
+    });
 
     var nextActive = serverActive.filter(function (item) {
       return !state.pendingSkips[item.id];
@@ -383,12 +408,47 @@
     }
 
     var devCount = typeof data.deviceCount === 'number' ? data.deviceCount : 0;
+    state.deviceCount = devCount;
+    state.checkedAt = data.checkedAt || '';
     document.getElementById('metaText').textContent =
-      '接続端末 ' + devCount + '台 / 更新 ' + (data.checkedAt || '');
+      '接続端末 ' + devCount + '台 / 更新 ' + state.checkedAt;
 
     if (data.widgetSummary) {
       syncWidgetSummary(data.widgetSummary, data);
     }
+  }
+
+  function buildOptimisticWidgetPayload() {
+    var active = sortByWhenMs(state.active);
+    var skipped = sortByWhenMs(state.skipped);
+    var next = active.length > 0 ? active[0] : null;
+    var widgetSummary = {
+      hasAlarm: active.length > 0,
+      nextAlarm: next ? {
+        id: next.id,
+        timeText: next.timeText,
+        dayBadge: next.dayBadge,
+        dateLabel: next.dateLabel,
+        deviceName: next.deviceName,
+        label: sanitizeLabel(next.label),
+        whenMs: next.whenMs
+      } : null,
+      remainingCount: Math.max(0, active.length - 1),
+      totalCount: active.length,
+      checkedAt: state.checkedAt || ''
+    };
+    return {
+      active: active,
+      skipped: skipped,
+      deviceCount: typeof state.deviceCount === 'number' ? state.deviceCount : 0,
+      checkedAt: state.checkedAt || '',
+      widgetSummary: widgetSummary
+    };
+  }
+
+  function syncOptimisticWidgetState() {
+    var optimisticPayload = buildOptimisticWidgetPayload();
+    syncWidgetSummary(optimisticPayload.widgetSummary, optimisticPayload);
   }
 
   function isBusyForAutoRefresh() {
@@ -483,6 +543,7 @@
     );
     state.pendingCount += 1;
     render();
+    syncOptimisticWidgetState();
     setStatus(target.timeText + ' (' + target.deviceName + ') をスキップ中...', false);
 
     var nativeJob = buildNativeMutationJob('skip', target);
@@ -509,14 +570,15 @@
           setStatus(target.timeText + ' の次回分をスキップしました', false);
         }
       } catch (e) {
-        await completeNativeMutation(nativeJob.opId);
         state.hadMutationError = true;
         delete state.pendingSkips[target.id];
         state.pendingCount = Math.max(0, state.pendingCount - 1);
         if (e && e.needsLogin === true) {
+          await completeNativeMutation(nativeJob.opId);
           enterLoginMode(e.loginUrl);
           return;
         }
+        await releaseNativeInFlightMutation(nativeJob.opId);
         setStatus('スキップエラー: ' + e.message, true);
         await syncFromServerAfterError();
         render();
@@ -547,6 +609,7 @@
     );
     state.pendingCount += targets.length;
     render();
+    syncOptimisticWidgetState();
 
     if (targets.length === 1) {
       setStatus(targets[0].timeText + ' (' + targets[0].deviceName + ') を元に戻しています...', false);
@@ -580,14 +643,15 @@
             setStatus(doneMessage, false);
           }
         } catch (e) {
-          await completeNativeMutation(nativeJob.opId);
           state.hadMutationError = true;
           delete state.pendingRestores[target.id];
           state.pendingCount = Math.max(0, state.pendingCount - 1);
           if (e && e.needsLogin === true) {
+            await completeNativeMutation(nativeJob.opId);
             enterLoginMode(e.loginUrl);
             return;
           }
+          await releaseNativeInFlightMutation(nativeJob.opId);
           setStatus('復活エラー: ' + e.message, true);
           await syncFromServerAfterError();
           render();

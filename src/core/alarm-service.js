@@ -118,6 +118,13 @@ function createAlarmService(authManager, options = {}) {
   const restoreWaitMs = options.restoreWaitMs !== undefined ? options.restoreWaitMs : DEFAULT_RESTORE_WAIT_MS;
   const nowFn = typeof options.nowFn === 'function' ? options.nowFn : () => Date.now();
 
+  function withAuthRetry(fn) {
+    if (typeof authManager.runWithAuthRetry === 'function') {
+      return authManager.runWithAuthRetry(fn);
+    }
+    return fn();
+  }
+
   function getDevicesMap() {
     return authManager.connectAlexa().then((client) => new Promise((resolve, reject) => {
       if (typeof client.getDevices !== 'function') {
@@ -153,19 +160,21 @@ function createAlarmService(authManager, options = {}) {
   }
 
   async function buildAlarmsPayload() {
-    const [notifications, deviceMap] = await Promise.all([
-      getNotifications(),
-      getDevicesMap(),
-    ]);
-    const nowMs = nowFn();
-    const { active, skipped } = classifyNotifications(notifications, deviceMap, nowMs);
+    return withAuthRetry(async () => {
+      const [notifications, deviceMap] = await Promise.all([
+        getNotifications(),
+        getDevicesMap(),
+      ]);
+      const nowMs = nowFn();
+      const { active, skipped } = classifyNotifications(notifications, deviceMap, nowMs);
 
-    return {
-      active,
-      skipped,
-      deviceCount: Object.keys(deviceMap).length,
-      checkedAt: formatJstClock(nowMs),
-    };
+      return {
+        active,
+        skipped,
+        deviceCount: Object.keys(deviceMap).length,
+        checkedAt: formatJstClock(nowMs),
+      };
+    });
   }
 
   async function getWidgetSummary() {
@@ -230,74 +239,78 @@ function createAlarmService(authManager, options = {}) {
 
   async function skipAlarm(rawBody) {
     const body = rawBody && typeof rawBody === 'object' ? rawBody : {};
-    const client = await authManager.connectAlexa();
-    const notifFromBody = body.notification && typeof body.notification === 'object' ? body.notification : null;
-    const requestedId = body.id
-      || body.notificationIndex
-      || (notifFromBody && (notifFromBody.notificationIndex || notifFromBody.id))
-      || '';
-    const notifications = await getNotifications();
-    const target = findNotificationById(notifications, requestedId) || notifFromBody;
-    if (!target || typeof target !== 'object') {
-      throw new Error('スキップ対象のアラームが見つかりませんでした。');
-    }
+    return withAuthRetry(async () => {
+      const client = await authManager.connectAlexa();
+      const notifFromBody = body.notification && typeof body.notification === 'object' ? body.notification : null;
+      const requestedId = body.id
+        || body.notificationIndex
+        || (notifFromBody && (notifFromBody.notificationIndex || notifFromBody.id))
+        || '';
+      const notifications = await getNotifications();
+      const target = findNotificationById(notifications, requestedId) || notifFromBody;
+      if (!target || typeof target !== 'object') {
+        throw new Error('スキップ対象のアラームが見つかりませんでした。');
+      }
 
-    await cancelNotificationAsync(client, target);
-    const payload = await buildAlarmsPayload();
-    return { ok: true, skippedId: requestedId || target.notificationIndex || target.id || '', ...payload };
+      await cancelNotificationAsync(client, target);
+      const payload = await buildAlarmsPayload();
+      return { ok: true, skippedId: requestedId || target.notificationIndex || target.id || '', ...payload };
+    });
   }
 
   async function restoreAlarm(body) {
     const reqBody = body && typeof body === 'object' ? body : {};
-    const client = await authManager.connectAlexa();
-    const clientNotif = reqBody.notification || null;
-    const requestedId = reqBody.id
-      || reqBody.notificationIndex
-      || (clientNotif && (clientNotif.notificationIndex || clientNotif.id));
+    return withAuthRetry(async () => {
+      const client = await authManager.connectAlexa();
+      const clientNotif = reqBody.notification || null;
+      const requestedId = reqBody.id
+        || reqBody.notificationIndex
+        || (clientNotif && (clientNotif.notificationIndex || clientNotif.id));
 
-    const notifications = await getNotifications();
-    const serverNotif = findNotificationById(notifications, requestedId);
-    const baseNotif = serverNotif ? cloneJson(serverNotif) : (clientNotif ? cloneJson(clientNotif) : null);
-    if (!baseNotif) {
-      throw new Error('復活対象のアラームが見つかりませんでした。');
-    }
-
-    const targetDt = resolveRestoreDateTime(
-      baseNotif,
-      reqBody.originalDate || (clientNotif && clientNotif.originalDate),
-      reqBody.originalTime || (clientNotif && clientNotif.originalTime),
-      nowFn()
-    );
-    if (targetDt.date && targetDt.time) {
-      baseNotif.originalDate = targetDt.date;
-      baseNotif.originalTime = targetDt.time;
-    }
-
-    await changeNotificationAsync(client, baseNotif, false);
-    await delay(restoreWaitMs);
-
-    const assetId = baseNotif.musicAlarmId
-      ? `MUSIC-${baseNotif.musicAlarmId}`
-      : (baseNotif.sound && baseNotif.sound.id);
-    const targetIndex = baseNotif.notificationIndex || requestedId;
-
-    if (isAlarmType(baseNotif.type) && assetId && targetIndex && typeof client.setNotificationV2 === 'function' && targetDt.date && targetDt.time) {
-      const trigger = { scheduledTime: `${targetDt.date}T${targetDt.time.slice(0, 8)}` };
-      const recurrence = buildV2Recurrence(baseNotif);
-      if (recurrence) {
-        trigger.recurrence = recurrence;
+      const notifications = await getNotifications();
+      const serverNotif = findNotificationById(notifications, requestedId);
+      const baseNotif = serverNotif ? cloneJson(serverNotif) : (clientNotif ? cloneJson(clientNotif) : null);
+      if (!baseNotif) {
+        throw new Error('復活対象のアラームが見つかりませんでした。');
       }
-      await setNotificationV2Async(client, targetIndex, {
-        trigger,
-        extensions: [],
-        assets: [{ type: 'TONE', assetId }],
-      });
-    } else {
-      await changeNotificationAsync(client, baseNotif, true);
-    }
 
-    const payload = await buildAlarmsPayload();
-    return { ok: true, restoredId: requestedId, ...payload };
+      const targetDt = resolveRestoreDateTime(
+        baseNotif,
+        reqBody.originalDate || (clientNotif && clientNotif.originalDate),
+        reqBody.originalTime || (clientNotif && clientNotif.originalTime),
+        nowFn()
+      );
+      if (targetDt.date && targetDt.time) {
+        baseNotif.originalDate = targetDt.date;
+        baseNotif.originalTime = targetDt.time;
+      }
+
+      await changeNotificationAsync(client, baseNotif, false);
+      await delay(restoreWaitMs);
+
+      const assetId = baseNotif.musicAlarmId
+        ? `MUSIC-${baseNotif.musicAlarmId}`
+        : (baseNotif.sound && baseNotif.sound.id);
+      const targetIndex = baseNotif.notificationIndex || requestedId;
+
+      if (isAlarmType(baseNotif.type) && assetId && targetIndex && typeof client.setNotificationV2 === 'function' && targetDt.date && targetDt.time) {
+        const trigger = { scheduledTime: `${targetDt.date}T${targetDt.time.slice(0, 8)}` };
+        const recurrence = buildV2Recurrence(baseNotif);
+        if (recurrence) {
+          trigger.recurrence = recurrence;
+        }
+        await setNotificationV2Async(client, targetIndex, {
+          trigger,
+          extensions: [],
+          assets: [{ type: 'TONE', assetId }],
+        });
+      } else {
+        await changeNotificationAsync(client, baseNotif, true);
+      }
+
+      const payload = await buildAlarmsPayload();
+      return { ok: true, restoredId: requestedId, ...payload };
+    });
   }
 
   return {
