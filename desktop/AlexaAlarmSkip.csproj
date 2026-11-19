@@ -9,6 +9,9 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <AssemblyName>AlexaAlarmSkip</AssemblyName>
+    <Version>1.1.4</Version>
+    <AssemblyVersion>1.1.4.0</AssemblyVersion>
+    <FileVersion>1.1.4.0</FileVersion>
     <ApplicationIcon>..\assets\icons\app.ico</ApplicationIcon>
     <DebugType>embedded</DebugType>
     <NoWarn>MSB3277</NoWarn>
