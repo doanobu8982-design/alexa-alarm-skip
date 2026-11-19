@@ -42,7 +42,7 @@ Amazon Echo に設定された繰り返しアラームの**「次回分だけ」
 
 1. [GitHub Releases](https://github.com/doanobu8982-design/alexa-alarm-skip/releases) から最新の `alexa-alarm-skip-android_vX.Y.Z.apk` と `checksums.txt` をダウンロードします。
 2. 必要に応じてインストール前に SHA-256 チェックサムを検証します。
-3. リリース添付の APK は未署名ビルド（`app-release-unsigned.apk`）のため、実機へインストールする場合はご自身の署名鍵で署名するか、ソースからビルドしてください。
+3. Android 端末でダウンロードした `.apk` を開き、画面の案内に従って「提供元不明のアプリ（不明なアプリのインストール）」を許可してインストールします。
 
 ### ソースからの Android リリースビルド
 

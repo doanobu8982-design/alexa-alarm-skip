@@ -42,7 +42,7 @@ A personal utility (Windows Desktop App / Android App / CLI) that lets you skip 
 
 1. Download the latest `alexa-alarm-skip-android_vX.Y.Z.apk` and `checksums.txt` from [GitHub Releases](https://github.com/doanobu8982-design/alexa-alarm-skip/releases).
 2. Verify the SHA-256 checksum before installation if desired.
-3. The attached release APK is an unsigned build (`app-release-unsigned.apk`). Sign it with your own keystore or build from source before installing on a device.
+3. Open the downloaded `.apk` on your Android device and allow installation from unknown sources if prompted.
 
 ### Building a Signed Android APK from Source
 
