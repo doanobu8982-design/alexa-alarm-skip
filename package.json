@@ -1,0 +1,32 @@
+{
+  "name": "alexa-alarm-skip",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Alexa alarm skip tool for Echo Show",
+  "main": "prototype/skip-next-alarm.js",
+  "scripts": {
+    "selftest": "node prototype/skip-next-alarm.js --selftest",
+    "list": "node prototype/skip-next-alarm.js --list",
+    "skip": "node prototype/skip-next-alarm.js",
+    "web": "node prototype/web-ui.js",
+    "web:mobile": "node scripts/mobile-preview-server.js",
+    "web:mobile:auth": "node scripts/mobile-preview-server.js --fresh-auth",
+    "web:mobile:mock": "node scripts/mobile-preview-server.js --mock",
+    "icons": "py -3 scripts/build-icons.py",
+    "test": "node --test tests/core.test.js",
+    "test:mobile": "node --test tests/mobile.test.js",
+    "mobile:prepare": "node scripts/prepare-mobile.js",
+    "cap:sync": "npm run mobile:prepare && npx cap sync android",
+    "apk:debug": "npm run cap:sync && cd android && gradlew.bat assembleDebug",
+    "e2e:mock": "node scripts/e2e-mock-server.js"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/cli": "^8.6.2",
+    "@capacitor/core": "^8.6.2",
+    "@capacitor/preferences": "^8.0.1",
+    "@capawesome/capacitor-nodejs": "^0.3.0",
+    "@capgo/capacitor-inappbrowser": "^8.27.9",
+    "alexa-remote2": "^8.1.1"
+  }
+}

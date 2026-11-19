@@ -1,0 +1,9 @@
+{
+  "appId": "jp.personal.alexaalarmskips",
+  "appName": "Alexa アラーム管理",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  }
+}

@@ -1,0 +1,8 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Alexa アラーム管理</string>
+    <string name="title_activity_main">Alexa アラーム管理</string>
+    <string name="package_name">jp.personal.alexaalarmskips</string>
+    <string name="custom_url_scheme">jp.personal.alexaalarmskips</string>
+    <string name="widget_description">直近24時間以内の次回アラームを表示します</string>
+</resources>

@@ -1,0 +1,128 @@
+name: Clean Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Run Node.js automated tests
+        run: |
+          npm test
+          npm run test:mobile
+          npm run selftest
+
+      - name: Prepare mobile backend and sync Capacitor Android
+        run: |
+          npm run cap:sync
+          chmod +x android/gradlew
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platforms;android-36 build-tools;36.0.0'
+
+      - name: Run Android JVM unit tests
+        working-directory: android
+        run: ./gradlew testReleaseUnitTest
+
+      - name: Restore Android signing keystore from Secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_KEYSTORE_BASE64}" ] || [ -z "${ANDROID_STORE_PASSWORD}" ] || [ -z "${ANDROID_KEY_ALIAS}" ] || [ -z "${ANDROID_KEY_PASSWORD}" ]; then
+            echo "Error: One or more Android signing secrets are missing." >&2
+            exit 1
+          fi
+          KEYSTORE_PATH="${RUNNER_TEMP}/release.jks"
+          printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE_PATH}"
+          chmod 600 "${KEYSTORE_PATH}"
+          cat <<EOF> android/keystore.properties
+          storeFile=${KEYSTORE_PATH}
+          storePassword=${ANDROID_STORE_PASSWORD}
+          keyAlias=${ANDROID_KEY_ALIAS}
+          keyPassword=${ANDROID_KEY_PASSWORD}
+          EOF
+          chmod 600 android/keystore.properties
+
+      - name: Build signed Android Release APK
+        working-directory: android
+        run: ./gradlew assembleRelease
+
+      - name: Cleanup temporary signing secrets
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/release.jks" android/keystore.properties
+
+      - name: Package APK, Desktop ZIP, and SHA-256 Checksums
+        run: |
+          set -euo pipefail
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          TAG_NAME="${GITHUB_REF_NAME}"
+          APK_NAME="${REPO_NAME}_${TAG_NAME}.apk"
+          ZIP_NAME="${REPO_NAME}_${TAG_NAME}.zip"
+
+          SIGNED_APK="android/app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "${SIGNED_APK}" ]; then
+            echo "Error: Signed release APK not found at ${SIGNED_APK}." >&2
+            ls -la android/app/build/outputs/apk/release/ || true
+            exit 1
+          fi
+
+          mkdir -p dist/package
+          cp "${SIGNED_APK}" "dist/${APK_NAME}"
+
+          cp -R src prototype tests package.json package-lock.json README.md dist/package/
+          mkdir -p dist/package/assets
+          cp -R assets/icons dist/package/assets/
+
+          (cd dist/package && zip -r "../${ZIP_NAME}" .)
+          (cd dist && sha256sum "${APK_NAME}" "${ZIP_NAME}" > checksums.txt)
+          cat dist/checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.apk
+            dist/*.zip
+            dist/checksums.txt
