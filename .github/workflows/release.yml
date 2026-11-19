@@ -13,23 +13,31 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Dependencies
+        run: npm ci --omit=dev
       - name: Publish WinForms App
         run: dotnet publish desktop/AlexaAlarmSkip.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o dist/desktop
-
+      - name: Bundle Node.js App Files
+        shell: pwsh
+        run: |
+          Copy-Item -Path prototype, src, assets, www, node_modules -Destination dist/desktop -Recurse
+          Copy-Item -Path package.json -Destination dist/desktop
       - name: Package Windows ZIP
+        shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
           $zipName = "alexa-alarm-skip-windows_${tag}.zip"
           Compress-Archive -Path "dist/desktop/*" -DestinationPath $zipName
           $hash = (Get-FileHash $zipName -Algorithm SHA256).Hash.ToLower()
           "$hash  $zipName" | Out-File -FilePath "checksums-windows.txt" -Encoding utf8
-
       - name: Upload Windows Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -42,41 +50,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
-
-      - name: Setup Java 21
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
-
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-36 build-tools;36.0.0'
-
       - name: Install & Sync Capacitor
         run: |
           npm ci
           npm run cap:sync
           chmod +x android/gradlew
-
       - name: Build Android APK
         working-directory: ./android
         run: ./gradlew assembleRelease
-
       - name: Prepare APK
         run: |
           TAG_NAME="${{ github.ref_name }}"
           APK_NAME="alexa-alarm-skip-android_${TAG_NAME}.apk"
           cp android/app/build/outputs/apk/release/app-release-unsigned.apk "${APK_NAME}"
           sha256sum "${APK_NAME}" > checksums-android.txt
-
       - name: Upload Android Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -92,11 +92,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-
       - name: Combine Checksums
         run: |
           cat dist/windows-build/checksums-windows.txt dist/android-build/checksums-android.txt > checksums.txt
-
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:

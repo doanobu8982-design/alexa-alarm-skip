@@ -26,7 +26,7 @@ Amazon Echo に設定された繰り返しアラームの**「次回分だけ」
 
 - **Windows 10 / 11 (x64)**
 - **[.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)**（必須）
-- **Node.js 22 以上**（バックエンドサーバー起動用）
+- **[Node.js (v22以上)](https://nodejs.org/)**（必須・バックエンドサーバー起動用）
 - **Microsoft Edge WebView2 Runtime**（Windows 11 には標準搭載）
 
 ### 起動手順

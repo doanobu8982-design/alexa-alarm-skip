@@ -26,7 +26,7 @@ A personal utility (Windows Desktop App / Android App / CLI) that lets you skip 
 
 - **Windows 10 / 11 (x64)**
 - **[.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)** (Required)
-- **Node.js 22 or later** (Required for the local backend server)
+- **[Node.js (v22 or later)](https://nodejs.org/)** (Required for the local backend server)
 - **Microsoft Edge WebView2 Runtime** (Pre-installed on Windows 11)
 
 ### Launch Steps
