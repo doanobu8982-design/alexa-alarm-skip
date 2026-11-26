@@ -75,10 +75,13 @@ class AlarmWidgetPlugin : Plugin() {
         val widgetSummaryJson = prefs.getString(AlarmWidgetProvider.KEY_WIDGET_SUMMARY_JSON, null)
         val lastUpdatedMs = prefs.getLong(AlarmWidgetProvider.KEY_LAST_BG_UPDATED_MS, 0L)
         val authExpired = prefs.getBoolean(AlarmWidgetProvider.KEY_AUTH_EXPIRED, false)
-        val hasCache = !alarmsPayloadJson.isNullOrBlank()
+        val hasRawCache = !alarmsPayloadJson.isNullOrBlank()
+        val cacheExpired = hasRawCache && isCacheExpired(lastUpdatedMs)
+        val hasCache = hasRawCache && !cacheExpired
 
         val result = JSObject()
         result.put("hasCache", hasCache)
+        result.put("cacheExpired", cacheExpired)
         result.put("alarmsPayloadJson", alarmsPayloadJson ?: JSObject.NULL)
         result.put("widgetSummaryJson", widgetSummaryJson ?: JSObject.NULL)
         result.put("lastUpdatedMs", lastUpdatedMs)
@@ -243,8 +246,13 @@ class AlarmWidgetPlugin : Plugin() {
 
     companion object {
         val MUTATION_LOCK = Any()
+        internal const val CACHE_TTL_MS: Long = 6L * 60L * 60L * 1000L
         internal const val IN_FLIGHT_TTL_MS = 10_000L
         private val inFlightWebMutations = ConcurrentHashMap<String, Long>()
+
+        internal fun isCacheExpired(lastUpdatedMs: Long, nowMs: Long = System.currentTimeMillis()): Boolean {
+            return lastUpdatedMs <= 0L || (nowMs - lastUpdatedMs) > CACHE_TTL_MS
+        }
 
         internal fun markWebMutationInFlight(opId: String, nowMs: Long = System.currentTimeMillis()) {
             if (opId.isBlank()) return

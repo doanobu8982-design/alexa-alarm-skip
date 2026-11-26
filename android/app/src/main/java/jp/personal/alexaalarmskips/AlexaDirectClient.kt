@@ -50,6 +50,19 @@ class AlexaDirectClient(
         val days: Set<Int>
     )
 
+    private data class ParsedRRuleString(
+        val freq: String?,
+        val interval: Int?,
+        val byDay: List<String>
+    )
+
+    private data class ParsedRRule(
+        val freq: String,
+        val interval: Int,
+        val byDay: List<String>,
+        val days: Set<Int>
+    )
+
     private data class TimeOfDay(
         val hours: Int,
         val minutes: Int,
@@ -380,7 +393,7 @@ class AlexaDirectClient(
                 val trigger = JSONObject().apply {
                     put("scheduledTime", "${targetDate}T${timePart}")
                 }
-                val recurrence = buildV2Recurrence(job.optCleanString("recurringPattern", ""))
+                val recurrence = buildV2Recurrence(job)
                 if (recurrence != null) {
                     trigger.put("recurrence", recurrence)
                 }
@@ -575,6 +588,149 @@ class AlexaDirectClient(
         }
     }
 
+    private fun extractValidWeekdayCodeList(arr: JSONArray?): List<String> {
+        if (arr == null || arr.length() == 0) return emptyList()
+        val seen = LinkedHashSet<String>()
+        for (i in 0 until arr.length()) {
+            if (arr.isNull(i)) continue
+            val code = arr.optString(i, "").trim().uppercase()
+            if (code.isNotEmpty() && code != "NULL" && WEEKDAY_TO_JS_DAY.containsKey(code)) {
+                seen.add(code)
+            }
+        }
+        return seen.toList()
+    }
+
+    private fun extractValidWeekdayCodes(arr: JSONArray?): JSONArray {
+        val out = JSONArray()
+        for (code in extractValidWeekdayCodeList(arr)) {
+            out.put(code)
+        }
+        return out
+    }
+
+    private fun parseRRuleString(ruleStr: String?): ParsedRRuleString {
+        if (ruleStr.isNullOrBlank()) return ParsedRRuleString(null, null, emptyList())
+        var freq: String? = null
+        var interval: Int? = null
+        var byDay: List<String> = emptyList()
+        for (part in ruleStr.split(";")) {
+            val eqIdx = part.indexOf('=')
+            if (eqIdx <= 0) continue
+            val key = part.substring(0, eqIdx).trim().uppercase()
+            val value = part.substring(eqIdx + 1).trim().uppercase()
+            if (value.isEmpty()) continue
+            when (key) {
+                "FREQ" -> freq = value
+                "INTERVAL" -> {
+                    val parsed = value.toIntOrNull()
+                    if (parsed != null && parsed > 0) {
+                        interval = parsed
+                    }
+                }
+                "BYDAY" -> {
+                    val seen = LinkedHashSet<String>()
+                    for (rawCode in value.split(",")) {
+                        val code = rawCode.trim().uppercase()
+                        if (code.isNotEmpty() && WEEKDAY_TO_JS_DAY.containsKey(code)) {
+                            seen.add(code)
+                        }
+                    }
+                    byDay = seen.toList()
+                }
+            }
+        }
+        return ParsedRRuleString(freq, interval, byDay)
+    }
+
+    private fun parseRRuleData(rRule: JSONObject?): ParsedRRule? {
+        if (rRule == null) return null
+
+        var parsedRule = ParsedRRuleString(null, null, emptyList())
+        val recRules = rRule.optJSONArray("recurrenceRules")
+        if (recRules != null) {
+            for (i in 0 until recRules.length()) {
+                if (recRules.isNull(i)) continue
+                val raw = recRules.optString(i, "").trim()
+                if (raw.isEmpty() || raw.equals("null", ignoreCase = true)) continue
+                val candidate = parseRRuleString(raw)
+                if (candidate.freq != null || candidate.byDay.isNotEmpty()) {
+                    parsedRule = candidate
+                    break
+                }
+            }
+        }
+
+        val explicitDays = extractValidWeekdayCodeList(rRule.optJSONArray("byWeekDays"))
+        val byDayCodes = if (explicitDays.isNotEmpty()) explicitDays else parsedRule.byDay
+
+        val rawFreq = rRule.optCleanString("frequency", "").trim().uppercase()
+        var freq = if (rawFreq.isNotEmpty()) rawFreq else parsedRule.freq
+        if (freq.isNullOrEmpty() && byDayCodes.isNotEmpty()) {
+            freq = "WEEKLY"
+        }
+        if (freq.isNullOrEmpty()) return null
+
+        val intervals = rRule.optJSONArray("intervals")
+        val explicitInterval = if (intervals != null && intervals.length() > 0 && !intervals.isNull(0)) {
+            intervals.optInt(0, 0)
+        } else {
+            0
+        }
+        val interval = when {
+            explicitInterval > 0 -> explicitInterval
+            parsedRule.interval != null && parsedRule.interval!! > 0 -> parsedRule.interval!!
+            else -> 1
+        }
+
+        if (freq == "DAILY") {
+            return ParsedRRule("DAILY", interval, emptyList(), setOf(0, 1, 2, 3, 4, 5, 6))
+        }
+        if (freq == "WEEKLY" && byDayCodes.isNotEmpty()) {
+            val days = LinkedHashSet<Int>()
+            for (code in byDayCodes) {
+                WEEKDAY_TO_JS_DAY[code]?.let { days.add(it) }
+            }
+            return ParsedRRule("WEEKLY", interval, byDayCodes, days)
+        }
+        return null
+    }
+
+    internal fun buildV2Recurrence(notification: JSONObject?): JSONObject? {
+        if (notification == null) return null
+
+        val trigRec = notification.optJSONObject("trigger")?.optJSONObject("recurrence")
+        if (trigRec != null) {
+            val freq = trigRec.optCleanString("freq", "")
+            if (freq.isNotBlank()) {
+                val byDay = extractValidWeekdayCodes(trigRec.optJSONArray("byDay"))
+                if (freq != "WEEKLY" || byDay.length() > 0) {
+                    return JSONObject().apply {
+                        put("freq", freq)
+                        put("interval", trigRec.optInt("interval", 1).coerceAtLeast(1))
+                        if (byDay.length() > 0) {
+                            put("byDay", byDay)
+                        }
+                    }
+                }
+            }
+        }
+
+        val parsedRRule = parseRRuleData(notification.optJSONObject("rRuleData"))
+        if (parsedRRule != null) {
+            return JSONObject().apply {
+                put("freq", parsedRRule.freq)
+                put("interval", parsedRRule.interval)
+                if (parsedRRule.byDay.isNotEmpty()) {
+                    put("byDay", JSONArray(parsedRRule.byDay))
+                }
+            }
+        }
+
+        val pattern = if (notification.isNull("recurringPattern")) "" else notification.optCleanString("recurringPattern", "")
+        return buildV2Recurrence(pattern)
+    }
+
     private fun buildV2Recurrence(pattern: String?): JSONObject? {
         if (pattern.isNullOrBlank()) return null
         if (pattern == "P1D") {
@@ -693,6 +849,10 @@ class AlexaDirectClient(
         return Pair(alarmsPayload, widgetSummary)
     }
 
+    internal fun buildNotificationsUrl(amazonPage: String, nowMs: Long = System.currentTimeMillis()): String {
+        return "https://alexa.$amazonPage/api/notifications?cached=false&_=$nowMs"
+    }
+
     private fun fetchNotificationsAndDevices(cookieJson: JSONObject): Pair<JSONArray, JSONArray> {
         val amazonPage = cookieJson.optCleanString("amazonPage", "").ifBlank { DEFAULT_AMAZON_PAGE }
         val localCookie = cookieJson.optCleanString("localCookie", "")
@@ -704,7 +864,7 @@ class AlexaDirectClient(
         val browserUserAgent = cookieJson.optCleanString("userAgent", "").ifBlank { BROWSER_USER_AGENT }
 
         val notifBody = executeAlexaApiGet(
-            url = "https://alexa.$amazonPage/api/notifications",
+            url = buildNotificationsUrl(amazonPage, nowProvider()),
             amazonPage = amazonPage,
             localCookie = localCookie,
             csrf = csrf,
@@ -959,7 +1119,7 @@ class AlexaDirectClient(
             put("status", n.optCleanString("status", "ON").ifBlank { "ON" })
             put("label", label)
             put("recurringPattern", recurringPattern ?: JSONObject.NULL)
-            put("recurringText", formatRecurring(recurringPattern))
+            put("recurringText", formatRecurring(n))
             put("originalDate", effectiveDate)
             put("originalTime", effectiveTime)
             put("scheduledDate", scheduledDate)
@@ -1037,12 +1197,64 @@ class AlexaDirectClient(
         return null
     }
 
+    private fun formatRecurrenceRule(rule: RecurrenceRule?): String? {
+        if (rule == null || rule.days.isEmpty()) return null
+        val uniqueDays = rule.days
+        if (rule.freq == "DAILY" || uniqueDays.size == 7) {
+            return "毎日"
+        }
+        if (uniqueDays.size == 5 && listOf(1, 2, 3, 4, 5).all { uniqueDays.contains(it) }) {
+            return "平日（月〜金）"
+        }
+        if (uniqueDays.size == 2 && uniqueDays.contains(0) && uniqueDays.contains(6)) {
+            return "週末（土日）"
+        }
+        if (uniqueDays.size == 1) {
+            val day = uniqueDays.first()
+            return "毎週${WEEKDAYS_JA[day]}曜"
+        }
+        val joined = DISPLAY_WEEKDAY_ORDER
+            .filter { uniqueDays.contains(it) }
+            .joinToString("・") { WEEKDAYS_JA[it] }
+        return if (joined.isNotEmpty()) "毎週 $joined" else null
+    }
+
+    private fun formatRecurring(n: JSONObject): String {
+        val rule = getRecurrenceRule(n)
+        val formatted = formatRecurrenceRule(rule)
+        if (formatted != null) return formatted
+        val pattern = if (n.isNull("recurringPattern")) null else n.optCleanString("recurringPattern", "").ifBlank { null }
+        return formatRecurring(pattern)
+    }
+
     private fun formatRecurring(pattern: String?): String {
         if (pattern.isNullOrBlank()) return "1回のみ"
         return RECURRING_LABELS[pattern] ?: pattern
     }
 
     private fun getRecurrenceRule(n: JSONObject): RecurrenceRule? {
+        val trigRec = n.optJSONObject("trigger")?.optJSONObject("recurrence")
+        if (trigRec != null) {
+            val freq = trigRec.optCleanString("freq", "")
+            val interval = trigRec.optInt("interval", 1)
+            if (freq.isNotBlank()) {
+                if (interval > 1) return null
+                if (freq == "DAILY") {
+                    return RecurrenceRule("DAILY", setOf(0, 1, 2, 3, 4, 5, 6))
+                }
+                if (freq == "WEEKLY") {
+                    val days = extractJsDays(trigRec.optJSONArray("byDay"))
+                    if (days.isNotEmpty()) return RecurrenceRule("WEEKLY", days)
+                }
+            }
+        }
+
+        val parsedRRule = parseRRuleData(n.optJSONObject("rRuleData"))
+        if (parsedRRule != null) {
+            if (parsedRRule.interval > 1) return null
+            return RecurrenceRule(parsedRRule.freq, parsedRRule.days)
+        }
+
         val pattern = if (n.isNull("recurringPattern")) "" else n.optCleanString("recurringPattern", "")
         when (pattern) {
             "P1D" -> return RecurrenceRule("DAILY", setOf(0, 1, 2, 3, 4, 5, 6))
@@ -1053,43 +1265,6 @@ class AlexaDirectClient(
         if (dayMatch != null) {
             val isoDay = dayMatch.groupValues[1].toInt()
             return RecurrenceRule("WEEKLY", setOf(if (isoDay == 7) 0 else isoDay))
-        }
-
-        val trigRec = n.optJSONObject("trigger")?.optJSONObject("recurrence")
-        if (trigRec != null) {
-            val freq = trigRec.optCleanString("freq", "")
-            val interval = trigRec.optInt("interval", 1)
-            if (freq.isNotBlank() && interval <= 1) {
-                if (freq == "DAILY") {
-                    return RecurrenceRule("DAILY", setOf(0, 1, 2, 3, 4, 5, 6))
-                }
-                if (freq == "WEEKLY") {
-                    val byDay = trigRec.optJSONArray("byDay")
-                    val days = extractJsDays(byDay)
-                    if (days.isNotEmpty()) return RecurrenceRule("WEEKLY", days)
-                }
-            } else if (freq.isNotBlank() && interval > 1) {
-                return null
-            }
-        }
-
-        val rRule = n.optJSONObject("rRuleData")
-        if (rRule != null) {
-            val freq = rRule.optCleanString("frequency", "")
-            val intervals = rRule.optJSONArray("intervals")
-            val interval = if (intervals != null && intervals.length() > 0) intervals.optInt(0, 1) else 1
-            if (freq.isNotBlank() && interval <= 1) {
-                if (freq == "DAILY") {
-                    return RecurrenceRule("DAILY", setOf(0, 1, 2, 3, 4, 5, 6))
-                }
-                if (freq == "WEEKLY") {
-                    val byWeekDays = rRule.optJSONArray("byWeekDays")
-                    val days = extractJsDays(byWeekDays)
-                    if (days.isNotEmpty()) return RecurrenceRule("WEEKLY", days)
-                }
-            } else if (freq.isNotBlank() && interval > 1) {
-                return null
-            }
         }
 
         return null
@@ -1268,6 +1443,7 @@ class AlexaDirectClient(
 
         private val JST_ZONE: ZoneOffset = ZoneOffset.ofHours(9)
         private val WEEKDAYS_JA = arrayOf("日", "月", "火", "水", "木", "金", "土")
+        private val DISPLAY_WEEKDAY_ORDER = listOf(1, 2, 3, 4, 5, 6, 0)
         private val WEEKDAY_TO_JS_DAY = mapOf(
             "SU" to 0,
             "MO" to 1,

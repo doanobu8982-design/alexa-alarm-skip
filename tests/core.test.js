@@ -11,6 +11,8 @@ const path = require('node:path');
 const {
   buildV2Recurrence,
   computeExpectedNextMs,
+  formatRecurrenceRule,
+  formatRecurring,
   formatTimeParts,
   getRecurrenceRule,
   nextTriggerMs,
@@ -191,6 +193,131 @@ describe('alarm-time.js', () => {
     assert.equal(buildV2Recurrence({}), null);
   });
 
+  it('prioritizes trigger.recurrence > rRuleData > recurringPattern and formats multi-day rules', () => {
+    // 1. Conflicting recurringPattern (Thursday) vs rRuleData (Friday)
+    const conflictNotif = {
+      recurringPattern: 'XXXX-WXX-4',
+      rRuleData: { frequency: 'WEEKLY', byWeekDays: ['FR'] },
+    };
+    assert.deepEqual(getRecurrenceRule(conflictNotif), { freq: 'WEEKLY', days: [5] });
+    assert.equal(formatRecurring(conflictNotif), '毎週金曜');
+    assert.deepEqual(buildV2Recurrence(conflictNotif), {
+      freq: 'WEEKLY',
+      interval: 1,
+      byDay: ['FR'],
+    });
+
+    // 2. Multi-day unsorted rRuleData with null recurringPattern
+    const multiDayNotif = {
+      recurringPattern: null,
+      rRuleData: { frequency: 'WEEKLY', byWeekDays: ['FR', 'MO', 'WE', 'FR', 'INVALID'] },
+    };
+    assert.deepEqual(getRecurrenceRule(multiDayNotif), { freq: 'WEEKLY', days: [5, 1, 3] });
+    assert.equal(formatRecurring(multiDayNotif), '毎週 月・水・金');
+    assert.deepEqual(buildV2Recurrence(multiDayNotif), {
+      freq: 'WEEKLY',
+      interval: 1,
+      byDay: ['FR', 'MO', 'WE'],
+    });
+
+    // 3. trigger.recurrence overrides both rRuleData and recurringPattern
+    const triggerPriorityNotif = {
+      recurringPattern: 'XXXX-WXX-4',
+      rRuleData: { frequency: 'WEEKLY', byWeekDays: ['FR'] },
+      trigger: { recurrence: { freq: 'WEEKLY', interval: 1, byDay: ['SA', 'SU'] } },
+    };
+    assert.deepEqual(getRecurrenceRule(triggerPriorityNotif), { freq: 'WEEKLY', days: [6, 0] });
+    assert.equal(formatRecurring(triggerPriorityNotif), '週末（土日）');
+    assert.deepEqual(buildV2Recurrence(triggerPriorityNotif), {
+      freq: 'WEEKLY',
+      interval: 1,
+      byDay: ['SA', 'SU'],
+    });
+
+    // 4. interval > 1 returns null without falling back to recurringPattern
+    assert.equal(
+      getRecurrenceRule({
+        recurringPattern: 'P1D',
+        trigger: { recurrence: { freq: 'DAILY', interval: 2 } },
+      }),
+      null
+    );
+    assert.equal(
+      getRecurrenceRule({
+        recurringPattern: 'P1D',
+        rRuleData: { frequency: 'WEEKLY', intervals: [2], byWeekDays: ['MO'] },
+      }),
+      null
+    );
+
+    // 5. Empty byDay in trigger.recurrence falls back to rRuleData / recurringPattern
+    assert.deepEqual(
+      getRecurrenceRule({
+        recurringPattern: 'XXXX-WXX-2',
+        trigger: { recurrence: { freq: 'WEEKLY', interval: 1, byDay: [] } },
+      }),
+      { freq: 'WEEKLY', days: [2] }
+    );
+
+    // 6. Backward-compatible string calls and formatRecurrenceRule
+    assert.equal(formatRecurring('P1D'), '毎日');
+    assert.equal(formatRecurring(null), '1回のみ');
+    assert.equal(formatRecurrenceRule({ freq: 'WEEKLY', days: [1, 2, 3, 4, 5] }), '平日（月〜金）');
+  });
+
+  it('parses rRuleData with null frequency via byWeekDays and recurrenceRules', () => {
+    // 1. Live reproduction case: frequency: null + byWeekDays + recurrenceRules + legacy recurringPattern
+    const realMulti = {
+      notificationIndex: 'real-multi-1',
+      type: 'Alarm',
+      status: 'ON',
+      deviceSerialNumber: 'S1',
+      originalDate: '2026-11-30',
+      originalTime: '08:45:00.000',
+      recurringPattern: 'XXXX-WXX-1',
+      rRuleData: {
+        byWeekDays: ['MO', 'TU', 'FR'],
+        flexibleRecurringPatternType: 'X_TIMES_A_WEEK',
+        frequency: null,
+        intervals: [1],
+        recurrenceRules: ['FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,FR'],
+      },
+    };
+    assert.equal(formatRecurring(realMulti), '毎週 月・火・金');
+    assert.deepEqual(buildV2Recurrence(realMulti), {
+      freq: 'WEEKLY',
+      interval: 1,
+      byDay: ['MO', 'TU', 'FR'],
+    });
+
+    // 2. byWeekDays: null with recurrenceRules only
+    const rulesOnly = {
+      recurringPattern: 'XXXX-WXX-1',
+      rRuleData: {
+        frequency: null,
+        byWeekDays: null,
+        recurrenceRules: ['FREQ=WEEKLY;INTERVAL=1;BYDAY=TH,TU'],
+      },
+    };
+    assert.equal(formatRecurring(rulesOnly), '毎週 火・木');
+    assert.deepEqual(buildV2Recurrence(rulesOnly), {
+      freq: 'WEEKLY',
+      interval: 1,
+      byDay: ['TH', 'TU'],
+    });
+
+    // 3. INTERVAL=2 in recurrenceRules returns null without falling back to recurringPattern
+    const biweekly = {
+      recurringPattern: 'XXXX-WXX-1',
+      rRuleData: {
+        frequency: null,
+        byWeekDays: null,
+        recurrenceRules: ['FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,FR'],
+      },
+    };
+    assert.equal(getRecurrenceRule(biweekly), null);
+  });
+
   it('resolveRestoreDateTime handles desired, recurring, and past date bump', () => {
     const now = Date.parse('2026-11-15T10:00:00+09:00');
     assert.deepEqual(
@@ -274,6 +401,75 @@ describe('alarm-service.js pure functions', () => {
     assert.deepEqual(res.skipped.map((x) => x.id), ['s1']);
     assert.equal(res.skipped[0].isSkipped, true);
     assert.equal(res.skipped[0].originalDate, '2026-11-16');
+  });
+
+  it('classifyNotifications detects skipped Friday alarm even when legacy recurringPattern says Thursday', () => {
+    // 2026-11-27 06:00:00+09:00 (Friday morning before 07:00 alarm)
+    const now = Date.parse('2026-11-27T06:00:00+09:00');
+    const deviceMap = { S1: 'Echo Show' };
+    const notifications = [
+      {
+        notificationIndex: 'fri-skipped',
+        type: 'Alarm',
+        status: 'ON',
+        deviceSerialNumber: 'S1',
+        recurringPattern: 'XXXX-WXX-4', // legacy Thursday
+        rRuleData: { frequency: 'WEEKLY', byWeekDays: ['FR'] }, // actual Friday
+        originalDate: '2026-12-04', // pushed to next Friday
+        originalTime: '07:00:00.000',
+        trigger: { scheduledTime: '2026-12-04T07:00:00+09:00' },
+      },
+      {
+        notificationIndex: 'multi-skipped',
+        type: 'Alarm',
+        status: 'ON',
+        deviceSerialNumber: 'S1',
+        recurringPattern: null,
+        rRuleData: { frequency: 'WEEKLY', byWeekDays: ['FR', 'MO', 'WE'] },
+        originalDate: '2026-11-30', // skipped Friday -> next Monday
+        originalTime: '08:00:00.000',
+        trigger: { scheduledTime: '2026-11-30T08:00:00+09:00' },
+      },
+    ];
+
+    const res = classifyNotifications(notifications, deviceMap, now);
+    assert.equal(res.active.length, 0);
+    assert.deepEqual(res.skipped.map((x) => x.id), ['fri-skipped', 'multi-skipped']);
+    assert.equal(res.skipped[0].recurringText, '毎週金曜');
+    assert.equal(res.skipped[0].originalDate, '2026-11-27');
+    assert.equal(res.skipped[1].recurringText, '毎週 月・水・金');
+    assert.equal(res.skipped[1].originalDate, '2026-11-27');
+  });
+
+  it('classifyNotifications handles live rRuleData with null frequency and recurrenceRules', () => {
+    // 2026-11-27 06:00:00+09:00 (Friday)
+    const now = Date.parse('2026-11-27T06:00:00+09:00');
+    const deviceMap = { S1: 'Echo Show' };
+    const notifications = [
+      {
+        notificationIndex: 'real-multi-1',
+        type: 'Alarm',
+        status: 'ON',
+        deviceSerialNumber: 'S1',
+        originalDate: '2026-11-30',
+        originalTime: '08:45:00.000',
+        recurringPattern: 'XXXX-WXX-1',
+        rRuleData: {
+          byWeekDays: ['MO', 'TU', 'FR'],
+          flexibleRecurringPatternType: 'X_TIMES_A_WEEK',
+          frequency: null,
+          intervals: [1],
+          recurrenceRules: ['FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,FR'],
+        },
+      },
+    ];
+
+    const res = classifyNotifications(notifications, deviceMap, now);
+    assert.equal(res.active.length, 0);
+    assert.equal(res.skipped.length, 1);
+    assert.equal(res.skipped[0].id, 'real-multi-1');
+    assert.equal(res.skipped[0].recurringText, '毎週 月・火・金');
+    assert.equal(res.skipped[0].whenMs, Date.parse('2026-11-27T08:45:00+09:00'));
   });
 
   it('buildWidgetSummary builds summary for 0, 1, and multiple alarms', () => {

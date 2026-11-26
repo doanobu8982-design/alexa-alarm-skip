@@ -37,7 +37,7 @@ function serializeAlarm(n, deviceMap, whenMs, nowMs, options = {}) {
     status: n.status || 'ON',
     label: n.alarmLabel || n.reminderLabel || n.label || '',
     recurringPattern: n.recurringPattern || null,
-    recurringText: formatRecurring(n.recurringPattern),
+    recurringText: formatRecurring(n),
     originalDate: effectiveDate,
     originalTime: effectiveTime,
     scheduledDate: n.originalDate || (options.scheduledMs ? jstDateKey(options.scheduledMs) : ''),

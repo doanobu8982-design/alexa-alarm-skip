@@ -7,6 +7,7 @@ const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 const WEEKDAYS_JA = ['日', '月', '火', '水', '木', '金', '土'];
 const WEEKDAY_TO_JS_DAY = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
 const WEEKDAY_CODES = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
+const DISPLAY_WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
 
 const RECURRING_LABELS = {
   P1D: '毎日',
@@ -57,9 +58,38 @@ function nextTriggerMs(n) {
   return null;
 }
 
-function formatRecurring(pattern) {
-  if (!pattern) return '1回のみ';
-  return RECURRING_LABELS[pattern] || String(pattern);
+function formatRecurrenceRule(rule) {
+  if (!rule || !Array.isArray(rule.days) || rule.days.length === 0) return null;
+  const uniqueDays = Array.from(new Set(rule.days));
+  if (rule.freq === 'DAILY' || uniqueDays.length === 7) {
+    return '毎日';
+  }
+  if (uniqueDays.length === 5 && [1, 2, 3, 4, 5].every((d) => uniqueDays.includes(d))) {
+    return '平日（月〜金）';
+  }
+  if (uniqueDays.length === 2 && uniqueDays.includes(0) && uniqueDays.includes(6)) {
+    return '週末（土日）';
+  }
+  if (uniqueDays.length === 1) {
+    return `毎週${WEEKDAYS_JA[uniqueDays[0]]}曜`;
+  }
+  const joined = DISPLAY_WEEKDAY_ORDER
+    .filter((d) => uniqueDays.includes(d))
+    .map((d) => WEEKDAYS_JA[d])
+    .join('・');
+  return joined ? `毎週 ${joined}` : null;
+}
+
+function formatRecurring(patternOrNotification) {
+  if (patternOrNotification && typeof patternOrNotification === 'object') {
+    const rule = getRecurrenceRule(patternOrNotification);
+    const formatted = formatRecurrenceRule(rule);
+    if (formatted) return formatted;
+    const pattern = patternOrNotification.recurringPattern;
+    return pattern ? (RECURRING_LABELS[pattern] || String(pattern)) : '1回のみ';
+  }
+  if (!patternOrNotification) return '1回のみ';
+  return RECURRING_LABELS[patternOrNotification] || String(patternOrNotification);
 }
 
 function toJstDate(epochMs) {
@@ -85,8 +115,115 @@ function formatJstClock(epochMs) {
   return `${pad2(dt.getUTCHours())}:${pad2(dt.getUTCMinutes())}:${pad2(dt.getUTCSeconds())}`;
 }
 
+function extractUniqueJsDays(codes) {
+  if (!Array.isArray(codes) || codes.length === 0) return [];
+  const days = codes
+    .map((code) => (typeof code === 'string' ? WEEKDAY_TO_JS_DAY[code.trim().toUpperCase()] : undefined))
+    .filter((d) => d !== undefined);
+  return Array.from(new Set(days));
+}
+
+function extractValidWeekdayCodes(codes) {
+  if (!Array.isArray(codes) || codes.length === 0) return [];
+  const valid = codes
+    .map((code) => (typeof code === 'string' ? code.trim().toUpperCase() : ''))
+    .filter((code) => code && WEEKDAY_TO_JS_DAY[code] !== undefined);
+  return Array.from(new Set(valid));
+}
+
+function parseRRuleString(ruleStr) {
+  const empty = { freq: null, interval: null, byDay: [] };
+  if (typeof ruleStr !== 'string' || !ruleStr.trim()) return empty;
+  let freq = null;
+  let interval = null;
+  let byDay = [];
+  for (const part of ruleStr.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = part.slice(0, eqIdx).trim().toUpperCase();
+    const val = part.slice(eqIdx + 1).trim().toUpperCase();
+    if (!val) continue;
+    if (key === 'FREQ') {
+      freq = val;
+    } else if (key === 'INTERVAL') {
+      const parsed = Number(val);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        interval = parsed;
+      }
+    } else if (key === 'BYDAY') {
+      byDay = extractValidWeekdayCodes(val.split(','));
+    }
+  }
+  return { freq, interval, byDay };
+}
+
+function parseRRuleData(rRule) {
+  if (!rRule || typeof rRule !== 'object') return null;
+
+  let parsedRule = { freq: null, interval: null, byDay: [] };
+  if (Array.isArray(rRule.recurrenceRules)) {
+    for (const raw of rRule.recurrenceRules) {
+      const candidate = parseRRuleString(raw);
+      if (candidate.freq || candidate.byDay.length > 0) {
+        parsedRule = candidate;
+        break;
+      }
+    }
+  }
+
+  const explicitDays = extractValidWeekdayCodes(rRule.byWeekDays);
+  const byDayCodes = explicitDays.length > 0 ? explicitDays : parsedRule.byDay;
+
+  let freq = typeof rRule.frequency === 'string' && rRule.frequency.trim()
+    ? rRule.frequency.trim().toUpperCase()
+    : parsedRule.freq;
+  if (!freq && byDayCodes.length > 0) {
+    freq = 'WEEKLY';
+  }
+  if (!freq) return null;
+
+  let interval = 1;
+  if (Array.isArray(rRule.intervals) && Number.isInteger(rRule.intervals[0]) && rRule.intervals[0] > 0) {
+    interval = rRule.intervals[0];
+  } else if (parsedRule.interval && parsedRule.interval > 0) {
+    interval = parsedRule.interval;
+  }
+
+  if (freq === 'DAILY') {
+    return { freq: 'DAILY', interval, byDay: [], days: [0, 1, 2, 3, 4, 5, 6] };
+  }
+  if (freq === 'WEEKLY' && byDayCodes.length > 0) {
+    return {
+      freq: 'WEEKLY',
+      interval,
+      byDay: byDayCodes,
+      days: byDayCodes.map((c) => WEEKDAY_TO_JS_DAY[c]),
+    };
+  }
+  return null;
+}
+
 function getRecurrenceRule(n) {
   if (!n || typeof n !== 'object') return null;
+
+  const trigRec = n.trigger && n.trigger.recurrence;
+  if (trigRec && trigRec.freq) {
+    if (trigRec.interval && trigRec.interval > 1) return null;
+    if (trigRec.freq === 'DAILY') {
+      return { freq: 'DAILY', days: [0, 1, 2, 3, 4, 5, 6] };
+    }
+    if (trigRec.freq === 'WEEKLY') {
+      const days = extractUniqueJsDays(trigRec.byDay);
+      if (days.length > 0) return { freq: 'WEEKLY', days };
+    }
+  }
+
+  const parsedRRule = parseRRuleData(n.rRuleData);
+  if (parsedRRule) {
+    if (parsedRRule.interval > 1) return null;
+    return { freq: parsedRRule.freq, days: parsedRRule.days };
+  }
+
   const pattern = n.recurringPattern;
   if (pattern === 'P1D') {
     return { freq: 'DAILY', days: [0, 1, 2, 3, 4, 5, 6] };
@@ -101,31 +238,6 @@ function getRecurrenceRule(n) {
   if (dayMatch) {
     const isoDay = Number(dayMatch[1]);
     return { freq: 'WEEKLY', days: [isoDay === 7 ? 0 : isoDay] };
-  }
-
-  const trigRec = n.trigger && n.trigger.recurrence;
-  if (trigRec && trigRec.freq) {
-    if (trigRec.interval && trigRec.interval > 1) return null;
-    if (trigRec.freq === 'DAILY') {
-      return { freq: 'DAILY', days: [0, 1, 2, 3, 4, 5, 6] };
-    }
-    if (trigRec.freq === 'WEEKLY' && Array.isArray(trigRec.byDay) && trigRec.byDay.length > 0) {
-      const days = trigRec.byDay.map((code) => WEEKDAY_TO_JS_DAY[code]).filter((d) => d !== undefined);
-      if (days.length > 0) return { freq: 'WEEKLY', days };
-    }
-  }
-
-  const rRule = n.rRuleData;
-  if (rRule && rRule.frequency) {
-    const interval = Array.isArray(rRule.intervals) && rRule.intervals[0] ? rRule.intervals[0] : 1;
-    if (interval > 1) return null;
-    if (rRule.frequency === 'DAILY') {
-      return { freq: 'DAILY', days: [0, 1, 2, 3, 4, 5, 6] };
-    }
-    if (rRule.frequency === 'WEEKLY' && Array.isArray(rRule.byWeekDays) && rRule.byWeekDays.length > 0) {
-      const days = rRule.byWeekDays.map((code) => WEEKDAY_TO_JS_DAY[code]).filter((d) => d !== undefined);
-      if (days.length > 0) return { freq: 'WEEKLY', days };
-    }
   }
 
   return null;
@@ -204,6 +316,33 @@ function formatTimeParts(whenMs, nowMs) {
 }
 
 function buildV2Recurrence(notification) {
+  const trigRec = notification && notification.trigger && notification.trigger.recurrence;
+  if (trigRec && trigRec.freq) {
+    const byDay = extractValidWeekdayCodes(trigRec.byDay);
+    if (trigRec.freq !== 'WEEKLY' || byDay.length > 0) {
+      const rec = {
+        freq: trigRec.freq,
+        interval: trigRec.interval || 1,
+      };
+      if (byDay.length > 0) {
+        rec.byDay = byDay;
+      }
+      return rec;
+    }
+  }
+
+  const parsedRRule = parseRRuleData(notification && notification.rRuleData);
+  if (parsedRRule) {
+    const rec = {
+      freq: parsedRRule.freq,
+      interval: parsedRRule.interval,
+    };
+    if (parsedRRule.byDay.length > 0) {
+      rec.byDay = [...parsedRRule.byDay];
+    }
+    return rec;
+  }
+
   const pattern = notification && notification.recurringPattern;
   if (pattern === 'P1D') {
     return { freq: 'DAILY', interval: 1 };
@@ -217,17 +356,6 @@ function buildV2Recurrence(notification) {
   const dayMatch = typeof pattern === 'string' && pattern.match(/^XXXX-WXX-([1-7])$/);
   if (dayMatch) {
     return { freq: 'WEEKLY', interval: 1, byDay: [WEEKDAY_CODES[Number(dayMatch[1]) - 1]] };
-  }
-  const rRule = notification && notification.rRuleData;
-  if (rRule && rRule.frequency) {
-    const rec = {
-      freq: rRule.frequency,
-      interval: Array.isArray(rRule.intervals) && rRule.intervals[0] ? rRule.intervals[0] : 1,
-    };
-    if (Array.isArray(rRule.byWeekDays) && rRule.byWeekDays.length > 0) {
-      rec.byDay = rRule.byWeekDays;
-    }
-    return rec;
   }
   return null;
 }
@@ -259,6 +387,7 @@ function resolveRestoreDateTime(baseNotif, desiredDate, desiredTime, nowMs = Dat
 }
 
 module.exports = {
+  DISPLAY_WEEKDAY_ORDER,
   JST_OFFSET_MS,
   JST_TIMEZONE,
   PAST_GRACE_MS,
@@ -274,6 +403,7 @@ module.exports = {
   extractAlarmTimeOfDay,
   formatJstClock,
   formatJstTimeWithMs,
+  formatRecurrenceRule,
   formatRecurring,
   formatTimeParts,
   getRecurrenceRule,

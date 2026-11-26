@@ -531,4 +531,168 @@ class AlexaDirectClientTest {
             AlarmWidgetPlugin.resetInFlightForTest()
         }
     }
+
+    @Test
+    fun buildNotificationsUrl_includesCachedFalseAndTimestamp() {
+        val dummyCookie = File("nonexistent-cookie.json")
+        val client = AlexaDirectClient(cookieFile = dummyCookie)
+        assertEquals(
+            "https://alexa.amazon.co.jp/api/notifications?cached=false&_=1700000000000",
+            client.buildNotificationsUrl("amazon.co.jp", 1_700_000_000_000L)
+        )
+    }
+
+    @Test
+    fun classifyAndBuildPayload_prioritizesRRuleDataAndTriggerRecurrenceOverLegacyPattern() {
+        // 2026-11-27 06:00:00+09:00 (Friday)
+        val nowMs = jstEpochMs("2026-11-27T06:00:00+09:00")
+        val client = AlexaDirectClient(cookieFile = File("dummy.json"), nowProvider = { nowMs })
+        val devices = JSONArray().apply {
+            put(JSONObject().apply {
+                put("serialNumber", "DEV_001")
+                put("accountName", "寝室 Echo")
+            })
+        }
+        val notifications = JSONArray().apply {
+            // Legacy recurringPattern=XXXX-WXX-4 (Thursday) vs rRuleData=['FR'] (Friday), skipped to next Friday
+            put(JSONObject().apply {
+                put("notificationIndex", "fri-skipped")
+                put("deviceSerialNumber", "DEV_001")
+                put("type", "Alarm")
+                put("status", "ON")
+                put("recurringPattern", "XXXX-WXX-4")
+                put("rRuleData", JSONObject().apply {
+                    put("frequency", "WEEKLY")
+                    put("byWeekDays", JSONArray(listOf("FR")))
+                })
+                put("originalDate", "2026-12-04")
+                put("originalTime", "07:00:00.000")
+                put("trigger", JSONObject().apply {
+                    put("scheduledTime", "2026-12-04T07:00:00.000+09:00")
+                })
+            })
+            // Multi-day unsorted rRuleData with null recurringPattern, skipped to Monday
+            put(JSONObject().apply {
+                put("notificationIndex", "multi-skipped")
+                put("deviceSerialNumber", "DEV_001")
+                put("type", "Alarm")
+                put("status", "ON")
+                put("recurringPattern", JSONObject.NULL)
+                put("rRuleData", JSONObject().apply {
+                    put("frequency", "WEEKLY")
+                    put("byWeekDays", JSONArray(listOf("FR", "MO", "WE")))
+                })
+                put("originalDate", "2026-11-30")
+                put("originalTime", "08:00:00.000")
+                put("trigger", JSONObject().apply {
+                    put("scheduledTime", "2026-11-30T08:00:00.000+09:00")
+                })
+            })
+        }
+
+        val (payload, _) = client.classifyAndBuildPayload(notifications, devices, nowMs)
+        assertEquals(0, payload.getJSONArray("active").length())
+        val skipped = payload.getJSONArray("skipped")
+        assertEquals(2, skipped.length())
+
+        val firstSkipped = skipped.getJSONObject(0)
+        assertEquals("fri-skipped", firstSkipped.getString("id"))
+        assertEquals("毎週金曜", firstSkipped.getString("recurringText"))
+        assertEquals("2026-11-27", firstSkipped.getString("originalDate"))
+
+        val secondSkipped = skipped.getJSONObject(1)
+        assertEquals("multi-skipped", secondSkipped.getString("id"))
+        assertEquals("毎週 月・水・金", secondSkipped.getString("recurringText"))
+        assertEquals("2026-11-27", secondSkipped.getString("originalDate"))
+    }
+
+    @Test
+    fun alarmWidgetPlugin_isCacheExpired_respectsSixHourTtl() {
+        val nowMs = 1_700_000_000_000L
+        assertTrue(AlarmWidgetPlugin.isCacheExpired(0L, nowMs))
+        assertTrue(AlarmWidgetPlugin.isCacheExpired(-1L, nowMs))
+        assertFalse(AlarmWidgetPlugin.isCacheExpired(nowMs - AlarmWidgetPlugin.CACHE_TTL_MS, nowMs))
+        assertTrue(AlarmWidgetPlugin.isCacheExpired(nowMs - AlarmWidgetPlugin.CACHE_TTL_MS - 1L, nowMs))
+    }
+
+    @Test
+    fun classifyAndBuildPayload_handlesNullFrequencyRRuleDataAndRecurrenceRules() {
+        // 2026-11-27 06:00:00+09:00 (Friday)
+        val nowMs = jstEpochMs("2026-11-27T06:00:00+09:00")
+        val client = AlexaDirectClient(cookieFile = File("dummy.json"), nowProvider = { nowMs })
+        val devices = JSONArray().apply {
+            put(JSONObject().apply {
+                put("serialNumber", "S1")
+                put("accountName", "Echo Show")
+            })
+        }
+        val realMulti = JSONObject().apply {
+            put("notificationIndex", "real-multi-1")
+            put("type", "Alarm")
+            put("status", "ON")
+            put("deviceSerialNumber", "S1")
+            put("originalDate", "2026-11-30")
+            put("originalTime", "08:45:00.000")
+            put("recurringPattern", "XXXX-WXX-1")
+            put("rRuleData", JSONObject().apply {
+                put("byWeekDays", JSONArray(listOf("MO", "TU", "FR")))
+                put("flexibleRecurringPatternType", "X_TIMES_A_WEEK")
+                put("frequency", JSONObject.NULL)
+                put("intervals", JSONArray(listOf(1)))
+                put("recurrenceRules", JSONArray(listOf("FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,FR")))
+            })
+        }
+        val rulesOnly = JSONObject().apply {
+            put("notificationIndex", "rules-only-1")
+            put("type", "Alarm")
+            put("status", "ON")
+            put("deviceSerialNumber", "S1")
+            put("originalDate", "2026-12-01")
+            put("originalTime", "09:00:00.000")
+            put("recurringPattern", "XXXX-WXX-1")
+            put("rRuleData", JSONObject().apply {
+                put("frequency", JSONObject.NULL)
+                put("byWeekDays", JSONObject.NULL)
+                put("recurrenceRules", JSONArray(listOf("FREQ=WEEKLY;INTERVAL=1;BYDAY=TH,TU")))
+            })
+        }
+        val biweekly = JSONObject().apply {
+            put("notificationIndex", "biweekly-1")
+            put("type", "Alarm")
+            put("status", "ON")
+            put("deviceSerialNumber", "S1")
+            put("originalDate", "2026-11-30")
+            put("originalTime", "10:00:00.000")
+            put("recurringPattern", "XXXX-WXX-1")
+            put("rRuleData", JSONObject().apply {
+                put("frequency", JSONObject.NULL)
+                put("byWeekDays", JSONObject.NULL)
+                put("recurrenceRules", JSONArray(listOf("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,FR")))
+            })
+        }
+
+        val (payload, _) = client.classifyAndBuildPayload(JSONArray().apply {
+            put(realMulti)
+            put(rulesOnly)
+            put(biweekly)
+        }, devices, nowMs)
+
+        assertEquals(0, payload.getJSONArray("active").length())
+        val skipped = payload.getJSONArray("skipped")
+        assertEquals(1, skipped.length())
+        val first = skipped.getJSONObject(0)
+        assertEquals("real-multi-1", first.getString("id"))
+        assertEquals("毎週 月・火・金", first.getString("recurringText"))
+        assertEquals(jstEpochMs("2026-11-27T08:45:00+09:00"), first.getLong("whenMs"))
+
+        val v2Real = client.buildV2Recurrence(realMulti)
+        assertNotNull(v2Real)
+        assertEquals("WEEKLY", v2Real!!.getString("freq"))
+        assertEquals(1, v2Real.getInt("interval"))
+        assertEquals(listOf("MO", "TU", "FR"), (0 until v2Real.getJSONArray("byDay").length()).map { v2Real.getJSONArray("byDay").getString(it) })
+
+        val v2RulesOnly = client.buildV2Recurrence(rulesOnly)
+        assertNotNull(v2RulesOnly)
+        assertEquals(listOf("TH", "TU"), (0 until v2RulesOnly!!.getJSONArray("byDay").length()).map { v2RulesOnly.getJSONArray("byDay").getString(it) })
+    }
 }

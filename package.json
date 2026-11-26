@@ -1,6 +1,6 @@
 {
   "name": "alexa-alarm-skip",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "private": true,
   "description": "Alexa alarm skip tool for Echo Show",
   "main": "prototype/skip-next-alarm.js",
